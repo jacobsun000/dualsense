@@ -7,7 +7,11 @@
 use crate::input::{Button, ButtonState, ControllerEvent, ControllerEventKind, Stick, StickAxis};
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, EventType, InputEvent, KeyCode, RelativeAxisCode};
-use std::{collections::HashMap, io, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    time::Instant,
+};
 
 const STICK_DEADZONE: f32 = 0.35;
 const MAX_SCROLL_PER_SECOND: f32 = 24.0;
@@ -41,6 +45,7 @@ pub struct KeyboardMapper {
     left_y: f32,
     active_sources: HashMap<Source, KeyCombo>,
     active_combos: HashMap<KeyCombo, usize>,
+    sequence_sources: HashSet<Source>,
     right_x: f32,
     right_y: f32,
     scroll_x_remainder: f32,
@@ -51,11 +56,19 @@ pub struct KeyboardMapper {
 impl KeyboardMapper {
     pub fn new() -> io::Result<Self> {
         let keyboard_keys: AttributeSet<KeyCode> = [
-            KeyCode::KEY_E,
-            KeyCode::KEY_G,
+            // The mapper's logical targets are written in QWERTY terms.
+            // These are the physical keycodes that produce them under Colemak.
+            KeyCode::KEY_F,
             KeyCode::KEY_I,
-            KeyCode::KEY_N,
-            KeyCode::KEY_U,
+            KeyCode::KEY_J,
+            KeyCode::KEY_K,
+            KeyCode::KEY_L,
+            KeyCode::KEY_R,
+            KeyCode::KEY_T,
+            KeyCode::KEY_W,
+            KeyCode::KEY_X,
+            KeyCode::KEY_ENTER,
+            KeyCode::KEY_P,
             KeyCode::KEY_SLASH,
             KeyCode::KEY_LEFT,
             KeyCode::KEY_RIGHT,
@@ -90,6 +103,7 @@ impl KeyboardMapper {
             left_y: 0.0,
             active_sources: HashMap::new(),
             active_combos: HashMap::new(),
+            sequence_sources: HashSet::new(),
             right_x: 0.0,
             right_y: 0.0,
             scroll_x_remainder: 0.0,
@@ -113,6 +127,19 @@ impl KeyboardMapper {
     }
 
     fn handle_button(&mut self, button: Button, state: ButtonState) -> io::Result<()> {
+        let source = Source::Button(button);
+        if button == Button::DpadUp {
+            if state == ButtonState::Down && self.r1_down {
+                if self.sequence_sources.insert(source) {
+                    self.emit_sequence(&[KeyCode::KEY_P, KeyCode::KEY_I, KeyCode::KEY_ENTER])?;
+                }
+                return Ok(());
+            }
+            if state == ButtonState::Up && self.sequence_sources.remove(&source) {
+                return Ok(());
+            }
+        }
+
         match button {
             Button::L1 => {
                 self.l1_down = state == ButtonState::Down;
@@ -165,7 +192,7 @@ impl KeyboardMapper {
             //     South
             Button::North => (
                 Direction::Up,
-                Some(key_combo(Some(KeyCode::KEY_LEFTCTRL), KeyCode::KEY_E)),
+                Some(key_combo(Some(KeyCode::KEY_LEFTCTRL), KeyCode::KEY_U)),
             ),
             Button::South => (
                 Direction::Down,
@@ -205,11 +232,16 @@ impl KeyboardMapper {
             });
         }
 
-        if matches!(button, Button::DpadLeft | Button::DpadRight) && self.r1_down {
+        if matches!(
+            button,
+            Button::DpadLeft | Button::DpadRight | Button::DpadDown
+        ) && self.r1_down
+        {
             return Some(match direction {
                 Direction::Left => key_combo(Some(KeyCode::KEY_LEFTALT), KeyCode::KEY_G),
-                Direction::Right => key_combo(Some(KeyCode::KEY_LEFTCTRL), KeyCode::KEY_SLASH),
-                _ => unreachable!(),
+                Direction::Right => key_combo(Some(KeyCode::KEY_LEFTCTRL), KeyCode::KEY_T),
+                Direction::Down => key_combo(Some(KeyCode::KEY_LEFTCTRL), KeyCode::KEY_W),
+                Direction::Up => combo.expect("D-pad up has a default mapping"),
             });
         }
         combo
@@ -257,6 +289,15 @@ impl KeyboardMapper {
                 self.active_combos.remove(&combo);
                 self.emit_combo(combo, false)?;
             }
+        }
+        Ok(())
+    }
+
+    fn emit_sequence(&mut self, keys: &[KeyCode]) -> io::Result<()> {
+        for &key in keys {
+            let combo = key_combo(None, key);
+            self.emit_combo(combo, true)?;
+            self.emit_combo(combo, false)?;
         }
         Ok(())
     }
@@ -324,7 +365,26 @@ impl Drop for KeyboardMapper {
 }
 
 fn key_combo(modifier: Option<KeyCode>, key: KeyCode) -> KeyCombo {
-    KeyCombo { modifier, key }
+    KeyCombo {
+        modifier,
+        key: colemak_physical_key(key),
+    }
+}
+
+/// Translate a logical QWERTY key to the physical Linux keycode that produces
+/// that same character with a Colemak layout. Modifiers, arrows, and slash are
+/// unchanged; only the letter targets used by this mapper need translation.
+fn colemak_physical_key(key: KeyCode) -> KeyCode {
+    match key {
+        KeyCode::KEY_E => KeyCode::KEY_K,
+        KeyCode::KEY_N => KeyCode::KEY_J,
+        KeyCode::KEY_I => KeyCode::KEY_L,
+        KeyCode::KEY_U => KeyCode::KEY_I,
+        KeyCode::KEY_G => KeyCode::KEY_T,
+        KeyCode::KEY_T => KeyCode::KEY_F,
+        KeyCode::KEY_P => KeyCode::KEY_R,
+        _ => key,
+    }
 }
 
 fn key_event(code: KeyCode, down: bool) -> InputEvent {
@@ -338,4 +398,22 @@ fn scroll_speed(value: f32) -> f32 {
     }
     let normalized = ((magnitude - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)).clamp(0.0, 1.0);
     value.signum() * normalized.powi(2) * MAX_SCROLL_PER_SECOND
+}
+
+#[cfg(test)]
+mod tests {
+    use super::colemak_physical_key;
+    use evdev::KeyCode;
+
+    #[test]
+    fn translates_logical_qwerty_letters_for_colemak() {
+        assert_eq!(colemak_physical_key(KeyCode::KEY_N), KeyCode::KEY_J);
+        assert_eq!(colemak_physical_key(KeyCode::KEY_I), KeyCode::KEY_L);
+        assert_eq!(colemak_physical_key(KeyCode::KEY_U), KeyCode::KEY_I);
+        assert_eq!(colemak_physical_key(KeyCode::KEY_E), KeyCode::KEY_K);
+        assert_eq!(colemak_physical_key(KeyCode::KEY_G), KeyCode::KEY_T);
+        assert_eq!(colemak_physical_key(KeyCode::KEY_T), KeyCode::KEY_F);
+        assert_eq!(colemak_physical_key(KeyCode::KEY_P), KeyCode::KEY_R);
+        assert_eq!(colemak_physical_key(KeyCode::KEY_LEFT), KeyCode::KEY_LEFT);
+    }
 }
