@@ -1,5 +1,6 @@
 use crate::input::{ControllerEvent, EventDecoder};
 use crate::keyboard::KeyboardMapper;
+use crate::light::ControllerLight;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossterm::{
     event::{self, Event as TerminalEvent, KeyCode as TerminalKeyCode},
@@ -127,6 +128,9 @@ struct ControllerState {
     calibration: JoystickCalibration,
     calibration_message: Option<String>,
     reader_error: Option<String>,
+    light: Option<ControllerLight>,
+    light_rgb: [u8; 3],
+    light_status: String,
     mic_status: String,
     mic_rms: f32,
     mic_peak: f32,
@@ -135,6 +139,20 @@ struct ControllerState {
 
 impl ControllerState {
     fn new(path: String, device: &Device) -> Self {
+        let light = ControllerLight::from_event_path(std::path::Path::new(&path));
+        let (light_rgb, light_status) = match light.as_ref() {
+            Some(light) => match light.current_rgb() {
+                Ok((red, green, blue)) => (
+                    [red, green, blue],
+                    "Use r/R, g/G, b/B to adjust; 0 turns it off".to_owned(),
+                ),
+                Err(error) => ([0, 0, 0], format!("RGB light read failed: {error}")),
+            },
+            None => (
+                [0, 0, 0],
+                "RGB LED not exposed by hid-playstation".to_owned(),
+            ),
+        };
         let mut state = Self {
             path,
             name: device.name().unwrap_or("DualSense").to_owned(),
@@ -193,6 +211,9 @@ impl ControllerState {
             },
             calibration_message: None,
             reader_error: None,
+            light,
+            light_rgb,
+            light_status,
             mic_status: "Searching for the DualSense microphone...".to_owned(),
             mic_rms: 0.0,
             mic_peak: 0.0,
@@ -286,6 +307,35 @@ impl ControllerState {
 
     fn dpad_right(&self) -> bool {
         self.dpad_x > 0 || self.pressed(KeyCode::BTN_DPAD_RIGHT) || self.pressed(KeyCode::KEY_RIGHT)
+    }
+
+    fn set_light(&mut self, rgb: [u8; 3]) {
+        let Some(light) = self.light.as_ref() else {
+            self.light_status = "RGB LED is unavailable".to_owned();
+            return;
+        };
+        let result = if rgb == [0, 0, 0] {
+            light.off()
+        } else {
+            light.set_rgb(rgb[0], rgb[1], rgb[2])
+        };
+        match result {
+            Ok(()) => {
+                self.light_rgb = rgb;
+                self.light_status = format!("RGB #{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                self.light_status =
+                    "RGB permission denied; install udev/99-dualsense-led.rules".to_owned();
+            }
+            Err(error) => self.light_status = format!("RGB light error: {error}"),
+        }
+    }
+
+    fn adjust_light(&mut self, channel: usize, delta: i16) {
+        let mut rgb = self.light_rgb;
+        rgb[channel] = (i16::from(rgb[channel]) + delta).clamp(0, 255) as u8;
+        self.set_light(rgb);
     }
 }
 
@@ -1170,7 +1220,10 @@ fn render_center_info(
                 .as_deref()
                 .unwrap_or("Reading input events..."),
         ),
-        Line::from(""),
+        Line::from(format!(
+            "Light: #{:02X}{:02X}{:02X} ({})",
+            state.light_rgb[0], state.light_rgb[1], state.light_rgb[2], state.light_status
+        )),
         Line::from(calibration_line),
     ];
     frame.render_widget(
@@ -1272,8 +1325,10 @@ fn draw(frame: &mut Frame<'_>, state: &ControllerState, calibration: Option<&Cal
         state.calibration.right_y,
     );
 
-    let footer = Paragraph::new("c: calibrate  Enter: advance/save  q/Esc: exit")
-        .style(Style::default().fg(Color::DarkGray));
+    let footer = Paragraph::new(
+        "c: calibrate  Enter: advance/save  r/R g/G b/B: light -/+  0: off  q/Esc: exit",
+    )
+    .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, outer[3]);
 }
 
@@ -1319,6 +1374,13 @@ fn run_app(
                         calibration = Some(CalibrationSession::new(&state));
                         state.calibration_message = None;
                     }
+                    TerminalKeyCode::Char('r') => state.adjust_light(0, -16),
+                    TerminalKeyCode::Char('R') => state.adjust_light(0, 16),
+                    TerminalKeyCode::Char('g') => state.adjust_light(1, -16),
+                    TerminalKeyCode::Char('G') => state.adjust_light(1, 16),
+                    TerminalKeyCode::Char('b') => state.adjust_light(2, -16),
+                    TerminalKeyCode::Char('B') => state.adjust_light(2, 16),
+                    TerminalKeyCode::Char('0') => state.set_light([0, 0, 0]),
                     TerminalKeyCode::Enter => {
                         if let Some(session) = calibration.as_mut() {
                             match session.stage {

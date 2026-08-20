@@ -12,6 +12,8 @@ use std::thread;
 
 mod input;
 use input::EventDecoder;
+mod light;
+use light::{ControllerLight, parse_color};
 mod keyboard;
 use keyboard::KeyboardMapper;
 
@@ -24,13 +26,17 @@ const DUALSENSE_BLUETOOTH_PRODUCT_ID: u16 = 0x0df2;
 
 fn usage() {
     println!(
-        "Usage: dualsense [--list | /dev/input/eventN]\n\n\
+        "Usage: dualsense [--list | --light <RRGGBB|off> | /dev/input/eventN]\n\n\
          With no argument, listen to the main gamepad evdev device.\n\
          Pass an event device path to listen to that device explicitly.\n\
+         Use --light to change the controller RGB indicator; optionally pass\n\
+         an event device path after the color.\n\
          Use --tui (with the tui feature) for an interactive status screen.\n\n\
          Examples:\n\
            dualsense\n\
            dualsense --list\n\
+           dualsense --light '#ff6600'\n\
+           dualsense --light off /dev/input/event24\n\
            dualsense /dev/input/event17\n\
            cargo run --features tui -- --tui"
     );
@@ -40,12 +46,14 @@ fn is_dualsense(device: &Device) -> bool {
     let name = device.name().unwrap_or_default().to_ascii_lowercase();
     let id = device.input_id();
 
-    name.contains("dualsense")
-        || (id.vendor() == SONY_VENDOR_ID
-            && matches!(
-                id.product(),
-                DUALSENSE_USB_PRODUCT_ID | DUALSENSE_BLUETOOTH_PRODUCT_ID
-            ))
+    // Do not identify devices by name alone: our virtual mapper devices are
+    // intentionally named "DualSense keyboard/mouse mapper" too. The Sony
+    // vendor ID is the important part of the identity check.
+    id.vendor() == SONY_VENDOR_ID
+        && (matches!(
+            id.product(),
+            DUALSENSE_USB_PRODUCT_ID | DUALSENSE_BLUETOOTH_PRODUCT_ID
+        ) || name.contains("dualsense"))
 }
 
 fn is_dualsense_gamepad(device: &Device) -> bool {
@@ -143,6 +151,65 @@ fn read_device(
 
 fn main() {
     let args: Vec<_> = env::args_os().skip(1).collect();
+
+    if args.first().is_some_and(|arg| arg == "--light") {
+        if !(2..=3).contains(&args.len()) {
+            usage();
+            std::process::exit(2);
+        }
+        let color_name = args[1].to_string_lossy();
+        let turn_off = color_name.eq_ignore_ascii_case("off");
+        let color = if turn_off {
+            Some((0, 0, 0))
+        } else {
+            parse_color(&color_name)
+        };
+        let Some(color) = color else {
+            eprintln!(
+                "Invalid color '{}'; use RRGGBB, #RRGGBB, or off",
+                color_name
+            );
+            std::process::exit(2);
+        };
+
+        let selected = if let Some(path) = args.get(2).map(PathBuf::from) {
+            match Device::open(&path) {
+                Ok(device) if is_dualsense_gamepad(&device) => Some((path, device)),
+                Ok(_) => {
+                    eprintln!("{} is not a DualSense gamepad device", path.display());
+                    None
+                }
+                Err(error) => {
+                    eprintln!("Could not open {}: {error}", path.display());
+                    None
+                }
+            }
+        } else {
+            evdev::enumerate().find(|(_, device)| is_dualsense_gamepad(device))
+        };
+        let Some((path, _device)) = selected else {
+            eprintln!("No DualSense gamepad evdev device found.");
+            std::process::exit(1);
+        };
+        let Some(light) = ControllerLight::from_event_path(&path) else {
+            eprintln!(
+                "No RGB LED sysfs device found for {}. Check that hid-playstation is loaded.",
+                path.display()
+            );
+            std::process::exit(1);
+        };
+        let result = if turn_off {
+            light.off()
+        } else {
+            light.set_rgb(color.0, color.1, color.2)
+        };
+        if let Err(error) = result {
+            eprintln!("Could not change controller light: {error}");
+            std::process::exit(1);
+        }
+        println!("Controller light set to {color_name}");
+        return;
+    }
 
     if args.first().is_some_and(|arg| arg == "--tui") {
         if args.len() > 2 {
