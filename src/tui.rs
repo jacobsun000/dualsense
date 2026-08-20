@@ -1,4 +1,5 @@
 use crate::input::{ControllerEvent, EventDecoder};
+use crate::keyboard::KeyboardMapper;
 use crossterm::{
     event::{self, Event as TerminalEvent, KeyCode as TerminalKeyCode},
     execute,
@@ -477,19 +478,34 @@ enum ReaderMessage {
     Error(String),
 }
 
-fn spawn_reader(mut device: Device, sender: Sender<ReaderMessage>) {
+fn spawn_reader(mut device: Device, sender: Sender<ReaderMessage>, mut mapper: KeyboardMapper) {
     thread::spawn(move || {
+        if let Err(error) = device.set_nonblocking(true) {
+            let _ = sender.send(ReaderMessage::Error(error.to_string()));
+            return;
+        }
         let mut decoder = EventDecoder::new(&device);
         loop {
             match device.fetch_events() {
                 Ok(events) => {
                     for raw_event in events {
                         for event in decoder.decode(raw_event) {
+                            if let Err(error) = mapper.handle(event) {
+                                let _ = sender.send(ReaderMessage::Error(error.to_string()));
+                                return;
+                            }
                             if sender.send(ReaderMessage::Input(event)).is_err() {
                                 return;
                             }
                         }
                     }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if let Err(error) = mapper.tick() {
+                        let _ = sender.send(ReaderMessage::Error(error.to_string()));
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => {
                     let _ = sender.send(ReaderMessage::Error(error.to_string()));
@@ -909,7 +925,8 @@ pub fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
 
     let (sender, receiver) = mpsc::channel();
     let state = ControllerState::new(path.display().to_string(), &device);
-    spawn_reader(device, sender);
+    let mapper = KeyboardMapper::new()?;
+    spawn_reader(device, sender, mapper);
 
     enable_raw_mode()?;
     let stdout = io::stdout();

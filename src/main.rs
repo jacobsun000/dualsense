@@ -12,6 +12,8 @@ use std::thread;
 
 mod input;
 use input::EventDecoder;
+mod keyboard;
+use keyboard::KeyboardMapper;
 
 #[cfg(feature = "tui")]
 mod tui;
@@ -94,8 +96,17 @@ fn button_event(code: KeyCode) -> bool {
     )
 }
 
-fn read_device(path: String, mut device: Device, output: Arc<Mutex<()>>) {
+fn read_device(
+    path: String,
+    mut device: Device,
+    output: Arc<Mutex<()>>,
+    mut mapper: KeyboardMapper,
+) {
     print_device_info(&path, &device);
+    if let Err(error) = device.set_nonblocking(true) {
+        eprintln!("[{path}] could not enable nonblocking input: {error}");
+        return;
+    }
     let mut decoder = EventDecoder::new(&device);
 
     loop {
@@ -103,10 +114,23 @@ fn read_device(path: String, mut device: Device, output: Arc<Mutex<()>>) {
             Ok(events) => {
                 for raw_event in events {
                     for event in decoder.decode(raw_event) {
+                        if let Err(error) = mapper.handle(event) {
+                            let _guard = output.lock().expect("output lock poisoned");
+                            eprintln!("[{path}] keyboard mapping stopped: {error}");
+                            return;
+                        }
                         let _guard = output.lock().expect("output lock poisoned");
                         println!("[{path}] {event:?}");
                     }
                 }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Err(error) = mapper.tick() {
+                    let _guard = output.lock().expect("output lock poisoned");
+                    eprintln!("[{path}] mouse mapping stopped: {error}");
+                    return;
+                }
+                thread::sleep(std::time::Duration::from_millis(5));
             }
             Err(error) => {
                 let _guard = output.lock().expect("output lock poisoned");
@@ -189,10 +213,17 @@ fn main() {
                     return;
                 }
 
+                let mapper = match KeyboardMapper::new() {
+                    Ok(mapper) => mapper,
+                    Err(error) => {
+                        eprintln!("Could not create keyboard mapping devices: {error}");
+                        std::process::exit(1);
+                    }
+                };
                 let path = path.display().to_string();
                 workers.push(thread::spawn({
                     let output = Arc::clone(&output);
-                    move || read_device(path, device, output)
+                    move || read_device(path, device, output, mapper)
                 }));
             }
             Err(error) => {
@@ -203,10 +234,17 @@ fn main() {
     } else {
         for (path, device) in evdev::enumerate() {
             if is_dualsense_gamepad(&device) {
+                let mapper = match KeyboardMapper::new() {
+                    Ok(mapper) => mapper,
+                    Err(error) => {
+                        eprintln!("Could not create keyboard mapping devices: {error}");
+                        return;
+                    }
+                };
                 let path = path.display().to_string();
                 workers.push(thread::spawn({
                     let output = Arc::clone(&output);
-                    move || read_device(path, device, output)
+                    move || read_device(path, device, output, mapper)
                 }));
             }
         }
