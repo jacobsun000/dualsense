@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
+default = ["tui"]
 tui = ["dep:crossterm", "dep:ratatui", "dep:serde", "dep:serde_json"]
 
 [dependencies]
