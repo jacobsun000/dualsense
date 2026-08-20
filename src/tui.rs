@@ -548,10 +548,15 @@ fn drain_voice_outputs(
     while let Some(message) = voice.try_recv() {
         match message {
             VoiceOutput::Transcript(text) => {
-                mapper.type_text(&text)?;
+                if !voice.type_final(&text)? {
+                    mapper.type_text(&text)?;
+                }
                 let _ = sender.send(ReaderMessage::MicStatus(format!("Voice input: {text}")));
             }
             VoiceOutput::PartialTranscript(text) => {
+                if !voice.type_partial(&text)? {
+                    mapper.type_text(&text)?;
+                }
                 let _ = sender.send(ReaderMessage::MicStatus(format!(
                     "Voice input (partial): {text}"
                 )));

@@ -1,9 +1,9 @@
 //! Push-to-talk voice input for the DualSense microphone.
 //!
 //! Holding the right face button (○) captures the controller microphone, streams 24 kHz PCM audio to
-//! OpenAI's realtime transcription session, and returns the completed transcript
-//! to the input reader. The reader types that transcript through the same
-//! virtual keyboard used by the controller mappings.
+//! OpenAI's realtime transcription session, and returns transcript updates to the
+//! input reader. Text is sent through Wayland's virtual keyboard protocol so Unicode
+//! is supported without changing the user's clipboard.
 
 use crate::input::ControllerEvent;
 #[cfg(feature = "voice")]
@@ -44,6 +44,56 @@ mod enabled {
         Light([u8; 3]),
     }
 
+    struct TextInput {
+        client: Option<wrtype::WrtypeClient>,
+        attempted: bool,
+        partial_seen: bool,
+    }
+
+    impl Default for TextInput {
+        fn default() -> Self {
+            Self {
+                client: None,
+                attempted: false,
+                partial_seen: false,
+            }
+        }
+    }
+
+    impl TextInput {
+        fn type_text(
+            &mut self,
+            text: &str,
+            output: &mpsc::Sender<VoiceOutput>,
+        ) -> io::Result<bool> {
+            if !self.attempted {
+                self.attempted = true;
+                match wrtype::WrtypeClient::new() {
+                    Ok(client) => {
+                        self.client = Some(client);
+                        let _ = output.send(VoiceOutput::Status(
+                            "Using Wayland virtual keyboard for transcription".to_owned(),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = output.send(VoiceOutput::Status(format!(
+                            "Wayland virtual keyboard unavailable; falling back to raw keyboard input: {error}"
+                        )));
+                        return Ok(false);
+                    }
+                }
+            }
+
+            let Some(client) = self.client.as_mut() else {
+                return Ok(false);
+            };
+            client
+                .type_text(text)
+                .map(|()| true)
+                .map_err(|error| io::Error::other(error.to_string()))
+        }
+    }
+
     struct AudioChunk {
         samples: Vec<f32>,
         sample_rate: u32,
@@ -63,6 +113,7 @@ mod enabled {
         outputs: Arc<Mutex<mpsc::Receiver<VoiceOutput>>>,
         output_sender: mpsc::Sender<VoiceOutput>,
         microphone_started: Arc<AtomicBool>,
+        text_input: Arc<Mutex<TextInput>>,
         light: Option<ControllerLight>,
     }
 
@@ -99,6 +150,7 @@ mod enabled {
                 outputs: Arc::new(Mutex::new(output_receiver)),
                 output_sender,
                 microphone_started: Arc::new(AtomicBool::new(false)),
+                text_input: Arc::new(Mutex::new(TextInput::default())),
                 light,
             };
             input.set_light([0, 0, 255]);
@@ -116,6 +168,7 @@ mod enabled {
 
             match state {
                 ButtonState::Down if !self.recording.swap(true, Ordering::AcqRel) => {
+                    self.begin_text_turn();
                     self.set_light([0, 255, 0]);
                     let _ = self.commands.send(WorkerMessage::Start);
                 }
@@ -150,6 +203,34 @@ mod enabled {
         pub fn try_recv(&self) -> Option<VoiceOutput> {
             let receiver = self.outputs.lock().expect("voice output lock poisoned");
             receiver.try_recv().ok()
+        }
+
+        fn begin_text_turn(&self) {
+            let mut input = self.text_input.lock().expect("text input lock poisoned");
+            input.partial_seen = false;
+        }
+
+        /// Type a transcript delta through Wayland's virtual keyboard.
+        ///
+        /// Returns `false` when the compositor does not expose the virtual
+        /// keyboard protocol, allowing callers to use the existing uinput
+        /// keyboard as a fallback for text it can represent.
+        pub fn type_partial(&self, text: &str) -> io::Result<bool> {
+            let mut input = self.text_input.lock().expect("text input lock poisoned");
+            input.partial_seen = true;
+            input.type_text(text, &self.output_sender)
+        }
+
+        /// Type a final transcript unless partial deltas have already been
+        /// emitted for this turn. The deltas are incremental, so typing the
+        /// final transcript again would duplicate the text.
+        pub fn type_final(&self, text: &str) -> io::Result<bool> {
+            let mut input = self.text_input.lock().expect("text input lock poisoned");
+            if input.partial_seen {
+                input.partial_seen = false;
+                return Ok(true);
+            }
+            input.type_text(text, &self.output_sender)
         }
 
         fn set_light(&self, rgb: [u8; 3]) {
@@ -901,5 +982,13 @@ impl VoiceInput {
 
     pub fn try_recv(&self) -> Option<VoiceOutput> {
         None
+    }
+
+    pub fn type_partial(&self, _: &str) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    pub fn type_final(&self, _: &str) -> io::Result<bool> {
+        Ok(false)
     }
 }

@@ -34,7 +34,7 @@ fn usage() {
          Use --light to change the controller RGB indicator; optionally pass\n\
          an event device path after the color.\n\
          Hold the right face button (○) to dictate through OPENAI_API_KEY;\n\
-         release to type the transcript.\n\
+         partial transcript text is typed as it arrives.\n\
          Use --tui (with the tui feature) for an interactive status screen.\n\n\
          Examples:\n\
            dualsense\n\
@@ -117,11 +117,16 @@ fn drain_voice_outputs(
     while let Some(message) = voice.try_recv() {
         match message {
             VoiceOutput::Transcript(text) => {
-                mapper.type_text(&text)?;
+                if !voice.type_final(&text)? {
+                    mapper.type_text(&text)?;
+                }
                 let _guard = output.lock().expect("output lock poisoned");
                 println!("[{path}] transcribed text: {text}");
             }
             VoiceOutput::PartialTranscript(text) => {
+                if !voice.type_partial(&text)? {
+                    mapper.type_text(&text)?;
+                }
                 let _guard = output.lock().expect("output lock poisoned");
                 println!("[{path}] transcribed text (partial): {text}");
             }
