@@ -1,7 +1,7 @@
 use crate::input::{ControllerEvent, EventDecoder};
 use crate::keyboard::KeyboardMapper;
 use crate::light::ControllerLight;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crate::voice::{VoiceInput, VoiceOutput};
 use crossterm::{
     event::{self, Event as TerminalEvent, KeyCode as TerminalKeyCode},
     execute,
@@ -21,7 +21,6 @@ use std::{
     collections::{HashSet, VecDeque},
     env,
     error::Error,
-    ffi::CString,
     fs, io,
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
@@ -538,9 +537,40 @@ enum ReaderMessage {
     Error(String),
     MicSample { rms: f32, peak: f32 },
     MicStatus(String),
+    Light([u8; 3]),
 }
 
-fn spawn_reader(mut device: Device, sender: Sender<ReaderMessage>, mut mapper: KeyboardMapper) {
+fn drain_voice_outputs(
+    voice: &VoiceInput,
+    mapper: &mut KeyboardMapper,
+    sender: &Sender<ReaderMessage>,
+) -> io::Result<()> {
+    while let Some(message) = voice.try_recv() {
+        match message {
+            VoiceOutput::Transcript(text) => {
+                mapper.type_text(&text)?;
+                let _ = sender.send(ReaderMessage::MicStatus(format!("Voice input: {text}")));
+            }
+            VoiceOutput::Status(status) => {
+                let _ = sender.send(ReaderMessage::MicStatus(status));
+            }
+            VoiceOutput::MicSample { rms, peak } => {
+                let _ = sender.send(ReaderMessage::MicSample { rms, peak });
+            }
+            VoiceOutput::Light(rgb) => {
+                let _ = sender.send(ReaderMessage::Light(rgb));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn spawn_reader(
+    mut device: Device,
+    sender: Sender<ReaderMessage>,
+    mut mapper: KeyboardMapper,
+    voice: VoiceInput,
+) {
     thread::spawn(move || {
         if let Err(error) = device.set_nonblocking(true) {
             let _ = sender.send(ReaderMessage::Error(error.to_string()));
@@ -548,10 +578,17 @@ fn spawn_reader(mut device: Device, sender: Sender<ReaderMessage>, mut mapper: K
         }
         let mut decoder = EventDecoder::new(&device);
         loop {
+            if let Err(error) = drain_voice_outputs(&voice, &mut mapper, &sender) {
+                let _ = sender.send(ReaderMessage::Error(format!(
+                    "Voice input stopped: {error}"
+                )));
+                return;
+            }
             match device.fetch_events() {
                 Ok(events) => {
                     for raw_event in events {
                         for event in decoder.decode(raw_event) {
+                            voice.handle(event);
                             if let Err(error) = mapper.handle(event) {
                                 let _ = sender.send(ReaderMessage::Error(error.to_string()));
                                 return;
@@ -574,349 +611,6 @@ fn spawn_reader(mut device: Device, sender: Sender<ReaderMessage>, mut mapper: K
                     return;
                 }
             }
-        }
-    });
-}
-
-/// Audio samples are exposed by ALSA/CPAL, not by the controller's evdev
-/// gamepad device. Keep the conversion here so all supported ALSA formats use
-/// the same normalized [-1, 1] range.
-trait NormalizedSample {
-    fn normalized(self) -> f32;
-}
-
-macro_rules! signed_sample {
-    ($type:ty, $max:expr) => {
-        impl NormalizedSample for $type {
-            fn normalized(self) -> f32 {
-                self as f32 / $max
-            }
-        }
-    };
-}
-
-macro_rules! unsigned_sample {
-    ($type:ty, $max:expr, $center:expr) => {
-        impl NormalizedSample for $type {
-            fn normalized(self) -> f32 {
-                (self as f32 - $center) / $max
-            }
-        }
-    };
-}
-
-signed_sample!(i8, 128.0);
-signed_sample!(i16, 32768.0);
-signed_sample!(i32, 2_147_483_648.0);
-signed_sample!(i64, 9_223_372_036_854_775_808.0);
-unsigned_sample!(u8, 128.0, 128.0);
-unsigned_sample!(u16, 32768.0, 32768.0);
-unsigned_sample!(u32, 2_147_483_648.0, 2_147_483_648.0);
-unsigned_sample!(
-    u64,
-    9_223_372_036_854_775_808.0,
-    9_223_372_036_854_775_808.0
-);
-
-impl NormalizedSample for f32 {
-    fn normalized(self) -> f32 {
-        self.clamp(-1.0, 1.0)
-    }
-}
-
-impl NormalizedSample for f64 {
-    fn normalized(self) -> f32 {
-        self.clamp(-1.0, 1.0) as f32
-    }
-}
-
-fn report_volume<T: cpal::SizedSample + NormalizedSample>(
-    samples: &[T],
-    sender: &Sender<ReaderMessage>,
-) {
-    if samples.is_empty() {
-        return;
-    }
-    let mut sum = 0.0_f32;
-    let mut peak = 0.0_f32;
-    for sample in samples {
-        let value = (*sample).normalized();
-        sum += value * value;
-        peak = peak.max(value.abs());
-    }
-    let rms = (sum / samples.len() as f32).sqrt().clamp(0.0, 1.0);
-    let _ = sender.send(ReaderMessage::MicSample { rms, peak });
-}
-
-struct StderrSilencer {
-    saved: libc::c_int,
-}
-
-impl StderrSilencer {
-    fn new() -> io::Result<Self> {
-        let null_path = CString::new("/dev/null").expect("static path has no NUL");
-        let null = unsafe { libc::open(null_path.as_ptr(), libc::O_WRONLY) };
-        if null < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
-        if saved < 0 {
-            unsafe { libc::close(null) };
-            return Err(io::Error::last_os_error());
-        }
-        if unsafe { libc::dup2(null, libc::STDERR_FILENO) } < 0 {
-            unsafe {
-                libc::close(null);
-                libc::close(saved);
-            }
-            return Err(io::Error::last_os_error());
-        }
-        unsafe { libc::close(null) };
-        Ok(Self { saved })
-    }
-}
-
-impl Drop for StderrSilencer {
-    fn drop(&mut self) {
-        unsafe {
-            libc::dup2(self.saved, libc::STDERR_FILENO);
-            libc::close(self.saved);
-        }
-    }
-}
-
-fn spawn_microphone(sender: Sender<ReaderMessage>) {
-    thread::spawn(move || {
-        // ALSA probes a number of virtual PCM aliases while CPAL enumerates
-        // devices. Those aliases can print harmless /dev/dsp, route and dmix
-        // diagnostics directly to stderr, corrupting the alternate screen.
-        // Keep stderr redirected for the stream lifetime; actual failures are
-        // still reported through the status line.
-        let _stderr_silencer = StderrSilencer::new().ok();
-        let host = cpal::default_host();
-        let devices = match host.devices() {
-            Ok(devices) => devices,
-            Err(error) => {
-                let _ = sender.send(ReaderMessage::MicStatus(format!(
-                    "Microphone unavailable: {error}"
-                )));
-                return;
-            }
-        };
-
-        // Do not use `input_devices()` here: it probes every ALSA alias
-        // (including OSS, route and dmix aliases), which can print noisy ALSA
-        // diagnostics such as `/dev/dsp` and channel-map errors. Select the
-        // real hardware PCM first, then probe only that device.
-        //
-        // The Linux hid-playstation driver registers the DualSense headset as
-        // an ALSA capture device. CPAL names it `hw:CARD=Controller,DEV=0` on
-        // most systems, while some PipeWire/ALSA setups include DualSense in
-        // the friendly name.
-        let device = devices
-            .filter_map(|device| {
-                let name = device.name().ok()?;
-                let lower = name.to_ascii_lowercase();
-                let rank = if lower.contains("hw:card=controller") && lower.contains("dev=0") {
-                    4
-                } else if lower.contains("dualsense") || lower.contains("wireless controller") {
-                    3
-                } else if lower.contains("controller") {
-                    1
-                } else {
-                    return None;
-                };
-                Some((rank, name, device))
-            })
-            .max_by_key(|(rank, _, _)| *rank);
-        let Some((_, device_name, device)) = device else {
-            let _ = sender.send(ReaderMessage::MicStatus(
-                "DualSense microphone not found (is the headset input exposed?)".to_owned(),
-            ));
-            return;
-        };
-        let supported_config = match device.default_input_config() {
-            Ok(config) => config,
-            Err(error) => {
-                let _ = sender.send(ReaderMessage::MicStatus(format!(
-                    "Cannot open {device_name}: {error}"
-                )));
-                return;
-            }
-        };
-        let config: cpal::StreamConfig = supported_config.clone().into();
-        let stream = match supported_config.sample_format() {
-            cpal::SampleFormat::I8 => {
-                let error_sender = sender.clone();
-                let data_sender = sender.clone();
-                device.build_input_stream(
-                    &config,
-                    move |data: &[i8], _| report_volume(data, &data_sender),
-                    move |error| {
-                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
-                            "Microphone stream error: {error}"
-                        )));
-                    },
-                    None,
-                )
-            }
-            cpal::SampleFormat::I16 => {
-                let error_sender = sender.clone();
-                let data_sender = sender.clone();
-                device.build_input_stream(
-                    &config,
-                    move |data: &[i16], _| report_volume(data, &data_sender),
-                    move |error| {
-                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
-                            "Microphone stream error: {error}"
-                        )));
-                    },
-                    None,
-                )
-            }
-            cpal::SampleFormat::I32 => {
-                let error_sender = sender.clone();
-                let data_sender = sender.clone();
-                device.build_input_stream(
-                    &config,
-                    move |data: &[i32], _| report_volume(data, &data_sender),
-                    move |error| {
-                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
-                            "Microphone stream error: {error}"
-                        )));
-                    },
-                    None,
-                )
-            }
-            cpal::SampleFormat::I64 => {
-                let error_sender = sender.clone();
-                let data_sender = sender.clone();
-                device.build_input_stream(
-                    &config,
-                    move |data: &[i64], _| report_volume(data, &data_sender),
-                    move |error| {
-                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
-                            "Microphone stream error: {error}"
-                        )));
-                    },
-                    None,
-                )
-            }
-            cpal::SampleFormat::U8 => {
-                let error_sender = sender.clone();
-                let data_sender = sender.clone();
-                device.build_input_stream(
-                    &config,
-                    move |data: &[u8], _| report_volume(data, &data_sender),
-                    move |error| {
-                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
-                            "Microphone stream error: {error}"
-                        )));
-                    },
-                    None,
-                )
-            }
-            cpal::SampleFormat::U16 => {
-                let error_sender = sender.clone();
-                let data_sender = sender.clone();
-                device.build_input_stream(
-                    &config,
-                    move |data: &[u16], _| report_volume(data, &data_sender),
-                    move |error| {
-                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
-                            "Microphone stream error: {error}"
-                        )));
-                    },
-                    None,
-                )
-            }
-            cpal::SampleFormat::U32 => {
-                let error_sender = sender.clone();
-                let data_sender = sender.clone();
-                device.build_input_stream(
-                    &config,
-                    move |data: &[u32], _| report_volume(data, &data_sender),
-                    move |error| {
-                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
-                            "Microphone stream error: {error}"
-                        )));
-                    },
-                    None,
-                )
-            }
-            cpal::SampleFormat::U64 => {
-                let error_sender = sender.clone();
-                let data_sender = sender.clone();
-                device.build_input_stream(
-                    &config,
-                    move |data: &[u64], _| report_volume(data, &data_sender),
-                    move |error| {
-                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
-                            "Microphone stream error: {error}"
-                        )));
-                    },
-                    None,
-                )
-            }
-            cpal::SampleFormat::F32 => {
-                let error_sender = sender.clone();
-                let data_sender = sender.clone();
-                device.build_input_stream(
-                    &config,
-                    move |data: &[f32], _| report_volume(data, &data_sender),
-                    move |error| {
-                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
-                            "Microphone stream error: {error}"
-                        )));
-                    },
-                    None,
-                )
-            }
-            cpal::SampleFormat::F64 => {
-                let error_sender = sender.clone();
-                let data_sender = sender.clone();
-                device.build_input_stream(
-                    &config,
-                    move |data: &[f64], _| report_volume(data, &data_sender),
-                    move |error| {
-                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
-                            "Microphone stream error: {error}"
-                        )));
-                    },
-                    None,
-                )
-            }
-            format => {
-                let _ = sender.send(ReaderMessage::MicStatus(format!(
-                    "Unsupported microphone sample format: {format}"
-                )));
-                return;
-            }
-        };
-
-        let stream = match stream {
-            Ok(stream) => stream,
-            Err(error) => {
-                let _ = sender.send(ReaderMessage::MicStatus(format!(
-                    "Cannot start {device_name}: {error}"
-                )));
-                return;
-            }
-        };
-        if let Err(error) = stream.play() {
-            let _ = sender.send(ReaderMessage::MicStatus(format!(
-                "Cannot play {device_name}: {error}"
-            )));
-            return;
-        }
-        let _ = sender.send(ReaderMessage::MicStatus(format!(
-            "Listening: {device_name}"
-        )));
-
-        // Keep the CPAL stream alive for the duration of the TUI session. The
-        // callback does the real-time work and sends only small volume samples.
-        loop {
-            thread::sleep(Duration::from_secs(1));
         }
     });
 }
@@ -1156,6 +850,7 @@ fn render_mapping_overlay(frame: &mut Frame<'_>) {
         Line::from("R1 + ↓  Ctrl+W"),
         Line::from("R1 + ←  Alt+G"),
         Line::from("R1 + →  Ctrl+T"),
+        Line::from("Hold ○  voice input (green); release types text"),
         Line::from(Span::styled("STICKS", active_style())),
         Line::from("Left stick  Meta+N/I/U/E"),
         Line::from("R1 + left stick  Meta+←/→/U/E"),
@@ -1421,6 +1116,10 @@ fn run_app(
                     }
                 }
                 ReaderMessage::MicStatus(status) => state.mic_status = status,
+                ReaderMessage::Light(rgb) => {
+                    state.light_rgb = rgb;
+                    state.light_status = format!("RGB #{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+                }
             }
         }
 
@@ -1429,49 +1128,48 @@ fn run_app(
         }
         terminal.draw(|frame| draw(frame, &state, calibration.as_ref(), show_mappings))?;
 
-        if event::poll(Duration::from_millis(50))? {
-            if let TerminalEvent::Key(key) = event::read()? {
-                match key.code {
-                    TerminalKeyCode::Esc | TerminalKeyCode::Char('q') => return Ok(()),
-                    TerminalKeyCode::Char('m') => show_mappings = !show_mappings,
-                    TerminalKeyCode::Char('c') => {
-                        calibration = Some(CalibrationSession::new(&state));
-                        state.calibration_message = None;
-                    }
-                    TerminalKeyCode::Char('r') => state.adjust_light(0, -16),
-                    TerminalKeyCode::Char('R') => state.adjust_light(0, 16),
-                    TerminalKeyCode::Char('g') => state.adjust_light(1, -16),
-                    TerminalKeyCode::Char('G') => state.adjust_light(1, 16),
-                    TerminalKeyCode::Char('b') => state.adjust_light(2, -16),
-                    TerminalKeyCode::Char('B') => state.adjust_light(2, 16),
-                    TerminalKeyCode::Char('0') => state.set_light([0, 0, 0]),
-                    TerminalKeyCode::Enter => {
-                        if let Some(session) = calibration.as_mut() {
-                            match session.stage {
-                                CalibrationStage::Center => session.finish_center(&state),
-                                CalibrationStage::Range => {
-                                    let result = session.finish_range(&state);
-                                    match save_calibration(result) {
-                                        Ok(()) => {
-                                            state.calibration = result;
-                                            state.calibration_message = Some(
-                                                "Calibration saved; press c to recalibrate"
-                                                    .to_owned(),
-                                            );
-                                        }
-                                        Err(error) => {
-                                            state.calibration_message = Some(format!(
-                                                "Calibration measured, but save failed: {error}"
-                                            ));
-                                        }
+        if event::poll(Duration::from_millis(50))?
+            && let TerminalEvent::Key(key) = event::read()?
+        {
+            match key.code {
+                TerminalKeyCode::Esc | TerminalKeyCode::Char('q') => return Ok(()),
+                TerminalKeyCode::Char('m') => show_mappings = !show_mappings,
+                TerminalKeyCode::Char('c') => {
+                    calibration = Some(CalibrationSession::new(&state));
+                    state.calibration_message = None;
+                }
+                TerminalKeyCode::Char('r') => state.adjust_light(0, -16),
+                TerminalKeyCode::Char('R') => state.adjust_light(0, 16),
+                TerminalKeyCode::Char('g') => state.adjust_light(1, -16),
+                TerminalKeyCode::Char('G') => state.adjust_light(1, 16),
+                TerminalKeyCode::Char('b') => state.adjust_light(2, -16),
+                TerminalKeyCode::Char('B') => state.adjust_light(2, 16),
+                TerminalKeyCode::Char('0') => state.set_light([0, 0, 0]),
+                TerminalKeyCode::Enter => {
+                    if let Some(session) = calibration.as_mut() {
+                        match session.stage {
+                            CalibrationStage::Center => session.finish_center(&state),
+                            CalibrationStage::Range => {
+                                let result = session.finish_range(&state);
+                                match save_calibration(result) {
+                                    Ok(()) => {
+                                        state.calibration = result;
+                                        state.calibration_message = Some(
+                                            "Calibration saved; press c to recalibrate".to_owned(),
+                                        );
                                     }
-                                    calibration = None;
+                                    Err(error) => {
+                                        state.calibration_message = Some(format!(
+                                            "Calibration measured, but save failed: {error}"
+                                        ));
+                                    }
                                 }
+                                calibration = None;
                             }
                         }
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
@@ -1502,9 +1200,10 @@ pub fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
 
     let (sender, receiver) = mpsc::channel();
     let state = ControllerState::new(path.display().to_string(), &device);
+    let voice = VoiceInput::new(state.light.clone())?;
     let mapper = KeyboardMapper::new()?;
-    spawn_reader(device, sender.clone(), mapper);
-    spawn_microphone(sender);
+    spawn_reader(device, sender.clone(), mapper, voice.clone());
+    voice.spawn_microphone();
 
     enable_raw_mode()?;
     let stdout = io::stdout();

@@ -5,10 +5,10 @@
 //! button and analog-axis events that a future keyboard mapper will consume.
 
 use evdev::{Device, KeyCode};
-use std::env;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::{env, io};
 
 mod input;
 use input::EventDecoder;
@@ -16,6 +16,8 @@ mod light;
 use light::{ControllerLight, parse_color};
 mod keyboard;
 use keyboard::KeyboardMapper;
+mod voice;
+use voice::{VoiceInput, VoiceOutput};
 
 #[cfg(feature = "tui")]
 mod tui;
@@ -31,6 +33,8 @@ fn usage() {
          Pass an event device path to listen to that device explicitly.\n\
          Use --light to change the controller RGB indicator; optionally pass\n\
          an event device path after the color.\n\
+         Hold the right face button (○) to dictate through OPENAI_API_KEY;\n\
+         release to type the transcript.\n\
          Use --tui (with the tui feature) for an interactive status screen.\n\n\
          Examples:\n\
            dualsense\n\
@@ -104,11 +108,35 @@ fn button_event(code: KeyCode) -> bool {
     )
 }
 
+fn drain_voice_outputs(
+    path: &str,
+    voice: &VoiceInput,
+    mapper: &mut KeyboardMapper,
+    output: &Arc<Mutex<()>>,
+) -> io::Result<()> {
+    while let Some(message) = voice.try_recv() {
+        match message {
+            VoiceOutput::Transcript(text) => {
+                mapper.type_text(&text)?;
+                let _guard = output.lock().expect("output lock poisoned");
+                println!("[{path}] voice input: {text}");
+            }
+            VoiceOutput::Status(status) => {
+                let _guard = output.lock().expect("output lock poisoned");
+                eprintln!("[{path}] {status}");
+            }
+            VoiceOutput::Light(_) | VoiceOutput::MicSample { .. } => {}
+        }
+    }
+    Ok(())
+}
+
 fn read_device(
     path: String,
     mut device: Device,
     output: Arc<Mutex<()>>,
     mut mapper: KeyboardMapper,
+    voice: VoiceInput,
 ) {
     print_device_info(&path, &device);
     if let Err(error) = device.set_nonblocking(true) {
@@ -118,10 +146,16 @@ fn read_device(
     let mut decoder = EventDecoder::new(&device);
 
     loop {
+        if let Err(error) = drain_voice_outputs(&path, &voice, &mut mapper, &output) {
+            let _guard = output.lock().expect("output lock poisoned");
+            eprintln!("[{path}] voice input stopped: {error}");
+            return;
+        }
         match device.fetch_events() {
             Ok(events) => {
                 for raw_event in events {
                     for event in decoder.decode(raw_event) {
+                        voice.handle(event);
                         if let Err(error) = mapper.handle(event) {
                             let _guard = output.lock().expect("output lock poisoned");
                             eprintln!("[{path}] keyboard mapping stopped: {error}");
@@ -287,10 +321,18 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
+                let voice = match VoiceInput::new(ControllerLight::from_event_path(&path)) {
+                    Ok(voice) => voice,
+                    Err(error) => {
+                        eprintln!("Could not initialize voice input: {error}");
+                        std::process::exit(1);
+                    }
+                };
+                voice.spawn_microphone();
                 let path = path.display().to_string();
                 workers.push(thread::spawn({
                     let output = Arc::clone(&output);
-                    move || read_device(path, device, output, mapper)
+                    move || read_device(path, device, output, mapper, voice)
                 }));
             }
             Err(error) => {
@@ -299,21 +341,39 @@ fn main() {
             }
         }
     } else {
-        for (path, device) in evdev::enumerate() {
-            if is_dualsense_gamepad(&device) {
-                let mapper = match KeyboardMapper::new() {
-                    Ok(mapper) => mapper,
-                    Err(error) => {
-                        eprintln!("Could not create keyboard mapping devices: {error}");
-                        return;
-                    }
-                };
-                let path = path.display().to_string();
-                workers.push(thread::spawn({
-                    let output = Arc::clone(&output);
-                    move || read_device(path, device, output, mapper)
-                }));
+        let devices: Vec<_> = evdev::enumerate()
+            .filter(|(_, device)| is_dualsense_gamepad(device))
+            .collect();
+        let Some((voice_path, _)) = devices.first() else {
+            eprintln!(
+                "No DualSense evdev device found. Connect the controller and check that your user\n\
+                 can read /dev/input/event* (for example, via the input group), then try again.\n\
+                 Use `dualsense --list` to inspect the devices that are visible."
+            );
+            return;
+        };
+        let voice = match VoiceInput::new(ControllerLight::from_event_path(voice_path)) {
+            Ok(voice) => voice,
+            Err(error) => {
+                eprintln!("Could not initialize voice input: {error}");
+                return;
             }
+        };
+        voice.spawn_microphone();
+        for (path, device) in devices {
+            let mapper = match KeyboardMapper::new() {
+                Ok(mapper) => mapper,
+                Err(error) => {
+                    eprintln!("Could not create keyboard mapping devices: {error}");
+                    return;
+                }
+            };
+            let path = path.display().to_string();
+            let voice = voice.clone();
+            workers.push(thread::spawn({
+                let output = Arc::clone(&output);
+                move || read_device(path, device, output, mapper, voice)
+            }));
         }
 
         if workers.is_empty() {

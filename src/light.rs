@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone)]
 pub struct ControllerLight {
     rgb_path: PathBuf,
 }
