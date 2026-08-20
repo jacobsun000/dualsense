@@ -19,6 +19,7 @@ voice = [
     "dep:serde_json",
     "dep:tokio",
     "dep:tokio-tungstenite",
+    "dep:rustls",
 ]
 
 [dependencies]
@@ -31,5 +32,6 @@ crossterm = { version = "0.29.0", optional = true }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"], optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { version = "1.0", optional = true, features = ["macros", "rt", "sync", "time"] }
 tokio-tungstenite = { version = "0.30", optional = true, default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

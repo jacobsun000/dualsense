@@ -551,6 +551,11 @@ fn drain_voice_outputs(
                 mapper.type_text(&text)?;
                 let _ = sender.send(ReaderMessage::MicStatus(format!("Voice input: {text}")));
             }
+            VoiceOutput::PartialTranscript(text) => {
+                let _ = sender.send(ReaderMessage::MicStatus(format!(
+                    "Voice input (partial): {text}"
+                )));
+            }
             VoiceOutput::Status(status) => {
                 let _ = sender.send(ReaderMessage::MicStatus(status));
             }

@@ -11,7 +11,7 @@ use std::thread;
 use std::{env, io};
 
 mod input;
-use input::EventDecoder;
+use input::{ControllerEventKind, EventDecoder};
 mod light;
 use light::{ControllerLight, parse_color};
 mod keyboard;
@@ -119,7 +119,11 @@ fn drain_voice_outputs(
             VoiceOutput::Transcript(text) => {
                 mapper.type_text(&text)?;
                 let _guard = output.lock().expect("output lock poisoned");
-                println!("[{path}] voice input: {text}");
+                println!("[{path}] transcribed text: {text}");
+            }
+            VoiceOutput::PartialTranscript(text) => {
+                let _guard = output.lock().expect("output lock poisoned");
+                println!("[{path}] transcribed text (partial): {text}");
             }
             VoiceOutput::Status(status) => {
                 let _guard = output.lock().expect("output lock poisoned");
@@ -161,8 +165,10 @@ fn read_device(
                             eprintln!("[{path}] keyboard mapping stopped: {error}");
                             return;
                         }
-                        let _guard = output.lock().expect("output lock poisoned");
-                        println!("[{path}] {event:?}");
+                        if let ControllerEventKind::Button { button, state } = event.kind {
+                            let _guard = output.lock().expect("output lock poisoned");
+                            println!("[{path}] button {button:?} {state:?}");
+                        }
                     }
                 }
             }

@@ -38,6 +38,7 @@ mod enabled {
     #[derive(Debug)]
     pub enum VoiceOutput {
         Transcript(String),
+        PartialTranscript(String),
         Status(String),
         MicSample { rms: f32, peak: f32 },
         Light([u8; 3]),
@@ -74,7 +75,9 @@ mod enabled {
             thread::Builder::new()
                 .name("dualsense-voice-session".to_owned())
                 .spawn(move || {
+                    let _ = rustls::crypto::ring::default_provider().install_default();
                     let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_io()
                         .enable_time()
                         .build()
                     {
@@ -331,6 +334,18 @@ mod enabled {
             return;
         };
         match event.get("type").and_then(Value::as_str) {
+            Some("input_audio_buffer.committed") => {
+                let _ = output.send(VoiceOutput::Status(
+                    "Voice audio committed; waiting for transcript".to_owned(),
+                ));
+            }
+            Some("conversation.item.input_audio_transcription.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
+                {
+                    let _ = output.send(VoiceOutput::PartialTranscript(delta.to_owned()));
+                }
+            }
             Some("conversation.item.input_audio_transcription.completed") => {
                 if let Some(transcript) = event.get("transcript").and_then(Value::as_str) {
                     let transcript = transcript.trim();
@@ -478,18 +493,21 @@ mod enabled {
         commands: tokio_mpsc::UnboundedSender<WorkerMessage>,
         output: mpsc::Sender<VoiceOutput>,
     ) {
-        let _stderr_silencer = StderrSilencer::new().ok();
         let host = cpal::default_host();
-        let devices = match host.devices() {
-            Ok(devices) => devices,
-            Err(error) => {
-                let _ = output.send(VoiceOutput::Status(format!(
-                    "Microphone unavailable: {error}"
-                )));
-                return;
+        let devices = {
+            let _stderr_silencer = StderrSilencer::new().ok();
+            match host.devices() {
+                Ok(devices) => devices.collect::<Vec<_>>(),
+                Err(error) => {
+                    let _ = output.send(VoiceOutput::Status(format!(
+                        "Microphone unavailable: {error}"
+                    )));
+                    return;
+                }
             }
         };
         let device = devices
+            .into_iter()
             .filter_map(|device| {
                 let name = device.name().ok()?;
                 let lower = name.to_ascii_lowercase();
@@ -865,6 +883,7 @@ pub struct VoiceInput;
 #[derive(Debug)]
 pub enum VoiceOutput {
     Transcript(String),
+    PartialTranscript(String),
     Status(String),
     MicSample { rms: f32, peak: f32 },
     Light([u8; 3]),
