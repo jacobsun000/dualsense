@@ -1,5 +1,6 @@
 use crate::input::{ControllerEvent, EventDecoder};
 use crate::keyboard::KeyboardMapper;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossterm::{
     event::{self, Event as TerminalEvent, KeyCode as TerminalKeyCode},
     execute,
@@ -16,9 +17,10 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     env,
     error::Error,
+    ffi::CString,
     fs, io,
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
@@ -125,6 +127,10 @@ struct ControllerState {
     calibration: JoystickCalibration,
     calibration_message: Option<String>,
     reader_error: Option<String>,
+    mic_status: String,
+    mic_rms: f32,
+    mic_peak: f32,
+    mic_history: VecDeque<f32>,
 }
 
 impl ControllerState {
@@ -187,6 +193,10 @@ impl ControllerState {
             },
             calibration_message: None,
             reader_error: None,
+            mic_status: "Searching for the DualSense microphone...".to_owned(),
+            mic_rms: 0.0,
+            mic_peak: 0.0,
+            mic_history: VecDeque::with_capacity(128),
         };
 
         if let Ok(absinfo) = device.get_absinfo() {
@@ -476,6 +486,8 @@ fn axis_values(state: &ControllerState) -> [i32; 4] {
 enum ReaderMessage {
     Input(ControllerEvent),
     Error(String),
+    MicSample { rms: f32, peak: f32 },
+    MicStatus(String),
 }
 
 fn spawn_reader(mut device: Device, sender: Sender<ReaderMessage>, mut mapper: KeyboardMapper) {
@@ -512,6 +524,349 @@ fn spawn_reader(mut device: Device, sender: Sender<ReaderMessage>, mut mapper: K
                     return;
                 }
             }
+        }
+    });
+}
+
+/// Audio samples are exposed by ALSA/CPAL, not by the controller's evdev
+/// gamepad device. Keep the conversion here so all supported ALSA formats use
+/// the same normalized [-1, 1] range.
+trait NormalizedSample {
+    fn normalized(self) -> f32;
+}
+
+macro_rules! signed_sample {
+    ($type:ty, $max:expr) => {
+        impl NormalizedSample for $type {
+            fn normalized(self) -> f32 {
+                self as f32 / $max
+            }
+        }
+    };
+}
+
+macro_rules! unsigned_sample {
+    ($type:ty, $max:expr, $center:expr) => {
+        impl NormalizedSample for $type {
+            fn normalized(self) -> f32 {
+                (self as f32 - $center) / $max
+            }
+        }
+    };
+}
+
+signed_sample!(i8, 128.0);
+signed_sample!(i16, 32768.0);
+signed_sample!(i32, 2_147_483_648.0);
+signed_sample!(i64, 9_223_372_036_854_775_808.0);
+unsigned_sample!(u8, 128.0, 128.0);
+unsigned_sample!(u16, 32768.0, 32768.0);
+unsigned_sample!(u32, 2_147_483_648.0, 2_147_483_648.0);
+unsigned_sample!(
+    u64,
+    9_223_372_036_854_775_808.0,
+    9_223_372_036_854_775_808.0
+);
+
+impl NormalizedSample for f32 {
+    fn normalized(self) -> f32 {
+        self.clamp(-1.0, 1.0)
+    }
+}
+
+impl NormalizedSample for f64 {
+    fn normalized(self) -> f32 {
+        self.clamp(-1.0, 1.0) as f32
+    }
+}
+
+fn report_volume<T: cpal::SizedSample + NormalizedSample>(
+    samples: &[T],
+    sender: &Sender<ReaderMessage>,
+) {
+    if samples.is_empty() {
+        return;
+    }
+    let mut sum = 0.0_f32;
+    let mut peak = 0.0_f32;
+    for sample in samples {
+        let value = (*sample).normalized();
+        sum += value * value;
+        peak = peak.max(value.abs());
+    }
+    let rms = (sum / samples.len() as f32).sqrt().clamp(0.0, 1.0);
+    let _ = sender.send(ReaderMessage::MicSample { rms, peak });
+}
+
+struct StderrSilencer {
+    saved: libc::c_int,
+}
+
+impl StderrSilencer {
+    fn new() -> io::Result<Self> {
+        let null_path = CString::new("/dev/null").expect("static path has no NUL");
+        let null = unsafe { libc::open(null_path.as_ptr(), libc::O_WRONLY) };
+        if null < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        if saved < 0 {
+            unsafe { libc::close(null) };
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::dup2(null, libc::STDERR_FILENO) } < 0 {
+            unsafe {
+                libc::close(null);
+                libc::close(saved);
+            }
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { libc::close(null) };
+        Ok(Self { saved })
+    }
+}
+
+impl Drop for StderrSilencer {
+    fn drop(&mut self) {
+        unsafe {
+            libc::dup2(self.saved, libc::STDERR_FILENO);
+            libc::close(self.saved);
+        }
+    }
+}
+
+fn spawn_microphone(sender: Sender<ReaderMessage>) {
+    thread::spawn(move || {
+        // ALSA probes a number of virtual PCM aliases while CPAL enumerates
+        // devices. Those aliases can print harmless /dev/dsp, route and dmix
+        // diagnostics directly to stderr, corrupting the alternate screen.
+        // Keep stderr redirected for the stream lifetime; actual failures are
+        // still reported through the status line.
+        let _stderr_silencer = StderrSilencer::new().ok();
+        let host = cpal::default_host();
+        let devices = match host.devices() {
+            Ok(devices) => devices,
+            Err(error) => {
+                let _ = sender.send(ReaderMessage::MicStatus(format!(
+                    "Microphone unavailable: {error}"
+                )));
+                return;
+            }
+        };
+
+        // Do not use `input_devices()` here: it probes every ALSA alias
+        // (including OSS, route and dmix aliases), which can print noisy ALSA
+        // diagnostics such as `/dev/dsp` and channel-map errors. Select the
+        // real hardware PCM first, then probe only that device.
+        //
+        // The Linux hid-playstation driver registers the DualSense headset as
+        // an ALSA capture device. CPAL names it `hw:CARD=Controller,DEV=0` on
+        // most systems, while some PipeWire/ALSA setups include DualSense in
+        // the friendly name.
+        let device = devices
+            .filter_map(|device| {
+                let name = device.name().ok()?;
+                let lower = name.to_ascii_lowercase();
+                let rank = if lower.contains("hw:card=controller") && lower.contains("dev=0") {
+                    4
+                } else if lower.contains("dualsense") || lower.contains("wireless controller") {
+                    3
+                } else if lower.contains("controller") {
+                    1
+                } else {
+                    return None;
+                };
+                Some((rank, name, device))
+            })
+            .max_by_key(|(rank, _, _)| *rank);
+        let Some((_, device_name, device)) = device else {
+            let _ = sender.send(ReaderMessage::MicStatus(
+                "DualSense microphone not found (is the headset input exposed?)".to_owned(),
+            ));
+            return;
+        };
+        let supported_config = match device.default_input_config() {
+            Ok(config) => config,
+            Err(error) => {
+                let _ = sender.send(ReaderMessage::MicStatus(format!(
+                    "Cannot open {device_name}: {error}"
+                )));
+                return;
+            }
+        };
+        let config: cpal::StreamConfig = supported_config.clone().into();
+        let stream = match supported_config.sample_format() {
+            cpal::SampleFormat::I8 => {
+                let error_sender = sender.clone();
+                let data_sender = sender.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[i8], _| report_volume(data, &data_sender),
+                    move |error| {
+                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
+                            "Microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::I16 => {
+                let error_sender = sender.clone();
+                let data_sender = sender.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[i16], _| report_volume(data, &data_sender),
+                    move |error| {
+                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
+                            "Microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::I32 => {
+                let error_sender = sender.clone();
+                let data_sender = sender.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[i32], _| report_volume(data, &data_sender),
+                    move |error| {
+                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
+                            "Microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::I64 => {
+                let error_sender = sender.clone();
+                let data_sender = sender.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[i64], _| report_volume(data, &data_sender),
+                    move |error| {
+                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
+                            "Microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::U8 => {
+                let error_sender = sender.clone();
+                let data_sender = sender.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[u8], _| report_volume(data, &data_sender),
+                    move |error| {
+                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
+                            "Microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::U16 => {
+                let error_sender = sender.clone();
+                let data_sender = sender.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[u16], _| report_volume(data, &data_sender),
+                    move |error| {
+                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
+                            "Microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::U32 => {
+                let error_sender = sender.clone();
+                let data_sender = sender.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[u32], _| report_volume(data, &data_sender),
+                    move |error| {
+                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
+                            "Microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::U64 => {
+                let error_sender = sender.clone();
+                let data_sender = sender.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[u64], _| report_volume(data, &data_sender),
+                    move |error| {
+                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
+                            "Microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::F32 => {
+                let error_sender = sender.clone();
+                let data_sender = sender.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[f32], _| report_volume(data, &data_sender),
+                    move |error| {
+                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
+                            "Microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::F64 => {
+                let error_sender = sender.clone();
+                let data_sender = sender.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[f64], _| report_volume(data, &data_sender),
+                    move |error| {
+                        let _ = error_sender.send(ReaderMessage::MicStatus(format!(
+                            "Microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+            }
+            format => {
+                let _ = sender.send(ReaderMessage::MicStatus(format!(
+                    "Unsupported microphone sample format: {format}"
+                )));
+                return;
+            }
+        };
+
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = sender.send(ReaderMessage::MicStatus(format!(
+                    "Cannot start {device_name}: {error}"
+                )));
+                return;
+            }
+        };
+        if let Err(error) = stream.play() {
+            let _ = sender.send(ReaderMessage::MicStatus(format!(
+                "Cannot play {device_name}: {error}"
+            )));
+            return;
+        }
+        let _ = sender.send(ReaderMessage::MicStatus(format!(
+            "Listening: {device_name}"
+        )));
+
+        // Keep the CPAL stream alive for the duration of the TUI session. The
+        // callback does the real-time work and sends only small volume samples.
+        loop {
+            thread::sleep(Duration::from_secs(1));
         }
     });
 }
@@ -626,6 +981,88 @@ fn render_stick(
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,
+    );
+}
+
+fn microphone_level(rms: f32) -> f32 {
+    if rms <= 0.000_001 {
+        0.0
+    } else {
+        // Display quiet speech usefully while retaining a 60 dB dynamic range.
+        ((20.0 * rms.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
+    }
+}
+
+fn microphone_db(rms: f32) -> String {
+    if rms <= 0.000_001 {
+        "-inf dB".to_owned()
+    } else {
+        format!("{:.1} dB", 20.0 * rms.log10())
+    }
+}
+
+fn render_microphone(frame: &mut Frame<'_>, area: Rect, state: &ControllerState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("DualSense microphone");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let graph_height = inner.height.saturating_sub(1) as usize;
+    let graph_width = inner.width as usize;
+    let start = state.mic_history.len().saturating_sub(graph_width);
+    let values: Vec<f32> = state
+        .mic_history
+        .iter()
+        .skip(start)
+        .map(|rms| microphone_level(*rms))
+        .collect();
+    let mut lines = Vec::with_capacity(graph_height);
+    for row in 0..graph_height {
+        let threshold = 1.0 - (row + 1) as f32 / graph_height.max(1) as f32;
+        let mut spans = Vec::with_capacity(graph_width);
+        let missing = graph_width.saturating_sub(values.len());
+        for column in 0..graph_width {
+            let value = if column < missing {
+                0.0
+            } else {
+                values[column - missing]
+            };
+            spans.push(if value >= threshold {
+                Span::styled("█", active_style())
+            } else {
+                Span::raw(" ")
+            });
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: graph_height as u16,
+        },
+    );
+
+    let status = format!(
+        "{}  RMS {}  peak {:>3}%",
+        state.mic_status,
+        microphone_db(state.mic_rms),
+        (state.mic_peak * 100.0).round() as u16
+    );
+    frame.render_widget(
+        Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
+        Rect {
+            x: inner.x,
+            y: inner.y + graph_height as u16,
+            width: inner.width,
+            height: 1,
+        },
     );
 }
 
@@ -805,7 +1242,12 @@ fn draw(frame: &mut Frame<'_>, state: &ControllerState, calibration: Option<&Cal
         state.calibration.left_y,
     );
 
-    render_center_info(frame, columns[1], state, calibration);
+    let center = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(8)])
+        .split(columns[1]);
+    render_center_info(frame, center[0], state, calibration);
+    render_microphone(frame, center[1], state);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -852,6 +1294,15 @@ fn run_app(
                     }
                 }
                 ReaderMessage::Error(error) => state.reader_error = Some(error),
+                ReaderMessage::MicSample { rms, peak } => {
+                    state.mic_rms = rms;
+                    state.mic_peak = peak;
+                    state.mic_history.push_back(rms);
+                    while state.mic_history.len() > 128 {
+                        state.mic_history.pop_front();
+                    }
+                }
+                ReaderMessage::MicStatus(status) => state.mic_status = status,
             }
         }
 
@@ -926,7 +1377,8 @@ pub fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let (sender, receiver) = mpsc::channel();
     let state = ControllerState::new(path.display().to_string(), &device);
     let mapper = KeyboardMapper::new()?;
-    spawn_reader(device, sender, mapper);
+    spawn_reader(device, sender.clone(), mapper);
+    spawn_microphone(sender);
 
     enable_raw_mode()?;
     let stdout = io::stdout();
