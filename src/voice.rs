@@ -119,8 +119,12 @@ mod enabled {
             client: &mut WrtypeClient,
             paste_with_shift: bool,
         ) -> io::Result<()> {
+            // Keep the data source alive until another copy replaces it. A
+            // clipboard manager may request the data before the target app
+            // receives the paste shortcut; limiting this to one request can
+            // therefore consume the source before the actual paste.
             let mut options = Options::new();
-            options.serve_requests(ServeRequests::Only(1));
+            options.serve_requests(ServeRequests::Unlimited);
             copy(
                 options,
                 Source::Bytes(text.as_bytes().to_vec().into_boxed_slice()),
