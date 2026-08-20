@@ -12,14 +12,16 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, Paragraph},
 };
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
+    env,
     error::Error,
-    io,
+    fs, io,
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const BUTTON_CODES: &[KeyCode] = &[
@@ -65,6 +67,45 @@ impl AxisState {
     fn percent(self) -> u16 {
         (((self.normalized() + 1.0) * 50.0).round() as u16).min(100)
     }
+
+    fn normalized_with(self, calibration: AxisCalibration) -> f64 {
+        let (low, high) = if self.value >= calibration.center {
+            (calibration.center, calibration.maximum)
+        } else {
+            (calibration.minimum, calibration.center)
+        };
+        let range = (high - low).max(1) as f64;
+        (((self.value - calibration.center) as f64) / range).clamp(-1.0, 1.0)
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct AxisCalibration {
+    center: i32,
+    minimum: i32,
+    maximum: i32,
+}
+
+impl AxisCalibration {
+    fn from_axis(axis: AxisState) -> Self {
+        Self {
+            center: (axis.minimum + axis.maximum) / 2,
+            minimum: axis.minimum,
+            maximum: axis.maximum,
+        }
+    }
+
+    fn valid(self) -> bool {
+        self.minimum < self.center && self.center < self.maximum
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct JoystickCalibration {
+    left_x: AxisCalibration,
+    left_y: AxisCalibration,
+    right_x: AxisCalibration,
+    right_y: AxisCalibration,
 }
 
 struct ControllerState {
@@ -79,6 +120,8 @@ struct ControllerState {
     right_trigger: AxisState,
     dpad_x: i32,
     dpad_y: i32,
+    calibration: JoystickCalibration,
+    calibration_message: Option<String>,
     reader_error: Option<String>,
 }
 
@@ -118,6 +161,29 @@ impl ControllerState {
             },
             dpad_x: 0,
             dpad_y: 0,
+            calibration: JoystickCalibration {
+                left_x: AxisCalibration {
+                    center: 0,
+                    minimum: -32768,
+                    maximum: 32767,
+                },
+                left_y: AxisCalibration {
+                    center: 0,
+                    minimum: -32768,
+                    maximum: 32767,
+                },
+                right_x: AxisCalibration {
+                    center: 0,
+                    minimum: -32768,
+                    maximum: 32767,
+                },
+                right_y: AxisCalibration {
+                    center: 0,
+                    minimum: -32768,
+                    maximum: 32767,
+                },
+            },
+            calibration_message: None,
             reader_error: None,
         };
 
@@ -133,6 +199,12 @@ impl ControllerState {
                 }
             }
         }
+        state.calibration = load_calibration().unwrap_or(JoystickCalibration {
+            left_x: AxisCalibration::from_axis(state.left_x),
+            left_y: AxisCalibration::from_axis(state.left_y),
+            right_x: AxisCalibration::from_axis(state.right_x),
+            right_y: AxisCalibration::from_axis(state.right_y),
+        });
         state
     }
 
@@ -203,6 +275,200 @@ impl ControllerState {
     fn dpad_right(&self) -> bool {
         self.dpad_x > 0 || self.pressed(KeyCode::BTN_DPAD_RIGHT) || self.pressed(KeyCode::KEY_RIGHT)
     }
+}
+
+fn default_calibration(state: &ControllerState) -> JoystickCalibration {
+    JoystickCalibration {
+        left_x: AxisCalibration::from_axis(state.left_x),
+        left_y: AxisCalibration::from_axis(state.left_y),
+        right_x: AxisCalibration::from_axis(state.right_x),
+        right_y: AxisCalibration::from_axis(state.right_y),
+    }
+}
+
+fn calibration_path() -> Option<PathBuf> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(base.join("dualsense").join("calibration.json"))
+}
+
+fn load_calibration() -> Option<JoystickCalibration> {
+    let text = fs::read_to_string(calibration_path()?).ok()?;
+    let calibration: JoystickCalibration = serde_json::from_str(&text).ok()?;
+    let axes = [
+        calibration.left_x,
+        calibration.left_y,
+        calibration.right_x,
+        calibration.right_y,
+    ];
+    axes.into_iter()
+        .all(AxisCalibration::valid)
+        .then_some(calibration)
+}
+
+fn save_calibration(calibration: JoystickCalibration) -> io::Result<()> {
+    let path = calibration_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(&calibration).map_err(io::Error::other)?;
+    fs::write(path, format!("{text}\n"))
+}
+
+#[derive(Clone, Copy)]
+enum CalibrationStage {
+    Center,
+    Range,
+}
+
+struct CalibrationSession {
+    stage: CalibrationStage,
+    started: Instant,
+    samples: u32,
+    sums: [i64; 4],
+    center: [i32; 4],
+    minimum: [i32; 4],
+    maximum: [i32; 4],
+}
+
+impl CalibrationSession {
+    fn new(state: &ControllerState) -> Self {
+        let values = axis_values(state);
+        Self {
+            stage: CalibrationStage::Center,
+            started: Instant::now(),
+            samples: 0,
+            sums: [0; 4],
+            center: values,
+            minimum: values,
+            maximum: values,
+        }
+    }
+
+    fn observe_event(&mut self, event: InputEvent) {
+        if !matches!(self.stage, CalibrationStage::Range)
+            || event.event_type() != EventType::ABSOLUTE
+        {
+            return;
+        }
+        let axis = AbsoluteAxisCode(event.code());
+        let index = match axis {
+            AbsoluteAxisCode::ABS_X => 0,
+            AbsoluteAxisCode::ABS_Y => 1,
+            AbsoluteAxisCode::ABS_RX => 2,
+            AbsoluteAxisCode::ABS_RY => 3,
+            _ => return,
+        };
+        let value = event.value();
+        self.minimum[index] = self.minimum[index].min(value);
+        self.maximum[index] = self.maximum[index].max(value);
+    }
+
+    fn sample(&mut self, state: &ControllerState) {
+        let values = axis_values(state);
+        match self.stage {
+            CalibrationStage::Center => {
+                for (sum, value) in self.sums.iter_mut().zip(values) {
+                    *sum += i64::from(value);
+                }
+                self.samples += 1;
+                if self.started.elapsed() >= Duration::from_secs(2) {
+                    self.finish_center(state);
+                }
+            }
+            CalibrationStage::Range => {
+                for ((minimum, maximum), value) in self
+                    .minimum
+                    .iter_mut()
+                    .zip(self.maximum.iter_mut())
+                    .zip(values)
+                {
+                    *minimum = (*minimum).min(value);
+                    *maximum = (*maximum).max(value);
+                }
+            }
+        }
+    }
+
+    fn finish_center(&mut self, state: &ControllerState) {
+        if self.samples > 0 {
+            self.center = self.sums.map(|sum| (sum / i64::from(self.samples)) as i32);
+        } else {
+            self.center = axis_values(state);
+        }
+        let values = axis_values(state);
+        self.minimum = values;
+        self.maximum = values;
+        self.stage = CalibrationStage::Range;
+        self.started = Instant::now();
+    }
+
+    fn finish_range(&self, state: &ControllerState) -> JoystickCalibration {
+        let fallback = default_calibration(state);
+        let axes = [
+            (
+                self.center[0],
+                self.minimum[0],
+                self.maximum[0],
+                fallback.left_x,
+            ),
+            (
+                self.center[1],
+                self.minimum[1],
+                self.maximum[1],
+                fallback.left_y,
+            ),
+            (
+                self.center[2],
+                self.minimum[2],
+                self.maximum[2],
+                fallback.right_x,
+            ),
+            (
+                self.center[3],
+                self.minimum[3],
+                self.maximum[3],
+                fallback.right_y,
+            ),
+        ];
+        let calibrated = axes.map(|(center, minimum, maximum, fallback)| {
+            let axis = AxisCalibration {
+                center,
+                minimum,
+                maximum,
+            };
+            if axis.valid() { axis } else { fallback }
+        });
+        JoystickCalibration {
+            left_x: calibrated[0],
+            left_y: calibrated[1],
+            right_x: calibrated[2],
+            right_y: calibrated[3],
+        }
+    }
+
+    fn status(&self) -> String {
+        match self.stage {
+            CalibrationStage::Center => format!(
+                "Release sticks: sampling center ({}/40)",
+                self.samples.min(40)
+            ),
+            CalibrationStage::Range => {
+                "Rotate both sticks through their full range, then press Enter".to_owned()
+            }
+        }
+    }
+}
+
+fn axis_values(state: &ControllerState) -> [i32; 4] {
+    [
+        state.left_x.value,
+        state.left_y.value,
+        state.right_x.value,
+        state.right_y.value,
+    ]
 }
 
 enum ReaderMessage {
@@ -295,15 +561,25 @@ fn render_face_buttons(frame: &mut Frame<'_>, area: Rect, state: &ControllerStat
     );
 }
 
-fn render_stick(frame: &mut Frame<'_>, area: Rect, title: &str, x: AxisState, y: AxisState) {
+fn render_stick(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    x: AxisState,
+    y: AxisState,
+    x_calibration: AxisCalibration,
+    y_calibration: AxisCalibration,
+) {
     // Fit the plot to small terminals too. The physical arrangement remains
     // useful even at the common 80x24 terminal size.
     let width = (area.width.saturating_sub(2) as usize).clamp(5, 13);
     let height = (area.height.saturating_sub(3) as usize).clamp(3, 9);
-    let col = ((x.normalized() + 1.0) * 0.5 * (width - 1) as f64).round() as usize;
+    let col =
+        ((x.normalized_with(x_calibration) + 1.0) * 0.5 * (width - 1) as f64).round() as usize;
     // Linux ABS_Y increases downward, which already matches terminal row
     // coordinates. Do not invert it a second time for the visual plot.
-    let row = (((y.normalized() + 1.0) * 0.5) * (height - 1) as f64).round() as usize;
+    let row =
+        (((y.normalized_with(y_calibration) + 1.0) * 0.5) * (height - 1) as f64).round() as usize;
     let mut lines = Vec::new();
 
     for current_row in 0..height {
@@ -414,7 +690,16 @@ fn render_shoulders(frame: &mut Frame<'_>, area: Rect, state: &ControllerState) 
     );
 }
 
-fn render_center_info(frame: &mut Frame<'_>, area: Rect, state: &ControllerState) {
+fn render_center_info(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &ControllerState,
+    calibration: Option<&CalibrationSession>,
+) {
+    let calibration_line = calibration
+        .map(CalibrationSession::status)
+        .or_else(|| state.calibration_message.clone())
+        .unwrap_or_else(|| "Press c to calibrate sticks".to_owned());
     let lines = vec![
         Line::from(Span::styled(
             "LIVE INPUT",
@@ -430,6 +715,8 @@ fn render_center_info(frame: &mut Frame<'_>, area: Rect, state: &ControllerState
                 .as_deref()
                 .unwrap_or("Reading input events..."),
         ),
+        Line::from(""),
+        Line::from(calibration_line),
     ];
     frame.render_widget(
         Paragraph::new(lines)
@@ -439,7 +726,7 @@ fn render_center_info(frame: &mut Frame<'_>, area: Rect, state: &ControllerState
     );
 }
 
-fn draw(frame: &mut Frame<'_>, state: &ControllerState) {
+fn draw(frame: &mut Frame<'_>, state: &ControllerState, calibration: Option<&CalibrationSession>) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -496,9 +783,11 @@ fn draw(frame: &mut Frame<'_>, state: &ControllerState) {
         &left_stick_title,
         state.left_x,
         state.left_y,
+        state.calibration.left_x,
+        state.calibration.left_y,
     );
 
-    render_center_info(frame, columns[1], state);
+    render_center_info(frame, columns[1], state, calibration);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -519,10 +808,12 @@ fn draw(frame: &mut Frame<'_>, state: &ControllerState) {
         &right_stick_title,
         state.right_x,
         state.right_y,
+        state.calibration.right_x,
+        state.calibration.right_y,
     );
 
-    let footer =
-        Paragraph::new("Press q or Esc to exit").style(Style::default().fg(Color::DarkGray));
+    let footer = Paragraph::new("c: calibrate  Enter: advance/save  q/Esc: exit")
+        .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, outer[3]);
 }
 
@@ -531,21 +822,61 @@ fn run_app(
     receiver: Receiver<ReaderMessage>,
     mut state: ControllerState,
 ) -> io::Result<()> {
+    let mut calibration: Option<CalibrationSession> = None;
+
     loop {
         while let Ok(message) = receiver.try_recv() {
             match message {
-                ReaderMessage::Input(event) => state.apply(event),
+                ReaderMessage::Input(event) => {
+                    state.apply(event);
+                    if let Some(session) = calibration.as_mut() {
+                        session.observe_event(event);
+                    }
+                }
                 ReaderMessage::Error(error) => state.reader_error = Some(error),
             }
         }
 
-        terminal.draw(|frame| draw(frame, &state))?;
+        if let Some(session) = calibration.as_mut() {
+            session.sample(&state);
+        }
+        terminal.draw(|frame| draw(frame, &state, calibration.as_ref()))?;
 
         if event::poll(Duration::from_millis(50))? {
-            if let TerminalEvent::Key(key) = event::read()?
-                && matches!(key.code, TerminalKeyCode::Esc | TerminalKeyCode::Char('q'))
-            {
-                return Ok(());
+            if let TerminalEvent::Key(key) = event::read()? {
+                match key.code {
+                    TerminalKeyCode::Esc | TerminalKeyCode::Char('q') => return Ok(()),
+                    TerminalKeyCode::Char('c') => {
+                        calibration = Some(CalibrationSession::new(&state));
+                        state.calibration_message = None;
+                    }
+                    TerminalKeyCode::Enter => {
+                        if let Some(session) = calibration.as_mut() {
+                            match session.stage {
+                                CalibrationStage::Center => session.finish_center(&state),
+                                CalibrationStage::Range => {
+                                    let result = session.finish_range(&state);
+                                    match save_calibration(result) {
+                                        Ok(()) => {
+                                            state.calibration = result;
+                                            state.calibration_message = Some(
+                                                "Calibration saved; press c to recalibrate"
+                                                    .to_owned(),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            state.calibration_message = Some(format!(
+                                                "Calibration measured, but save failed: {error}"
+                                            ));
+                                        }
+                                    }
+                                    calibration = None;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }
