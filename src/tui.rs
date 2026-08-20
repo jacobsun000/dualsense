@@ -1,3 +1,4 @@
+use crate::input::{ControllerEvent, EventDecoder};
 use crossterm::{
     event::{self, Event as TerminalEvent, KeyCode as TerminalKeyCode},
     execute,
@@ -472,20 +473,21 @@ fn axis_values(state: &ControllerState) -> [i32; 4] {
 }
 
 enum ReaderMessage {
-    Input(InputEvent),
+    Input(ControllerEvent),
     Error(String),
 }
 
 fn spawn_reader(mut device: Device, sender: Sender<ReaderMessage>) {
     thread::spawn(move || {
+        let mut decoder = EventDecoder::new(&device);
         loop {
             match device.fetch_events() {
                 Ok(events) => {
-                    for event in events {
-                        if super::event_kind(&event).is_some()
-                            && sender.send(ReaderMessage::Input(event)).is_err()
-                        {
-                            return;
+                    for raw_event in events {
+                        for event in decoder.decode(raw_event) {
+                            if sender.send(ReaderMessage::Input(event)).is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -828,9 +830,9 @@ fn run_app(
         while let Ok(message) = receiver.try_recv() {
             match message {
                 ReaderMessage::Input(event) => {
-                    state.apply(event);
+                    state.apply(event.raw);
                     if let Some(session) = calibration.as_mut() {
-                        session.observe_event(event);
+                        session.observe_event(event.raw);
                     }
                 }
                 ReaderMessage::Error(error) => state.reader_error = Some(error),

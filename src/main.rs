@@ -4,11 +4,14 @@
 //! evdev is preferable here to talking to the HID report directly: it gives us the same
 //! button and analog-axis events that a future keyboard mapper will consume.
 
-use evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode};
+use evdev::{Device, KeyCode};
 use std::env;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+mod input;
+use input::EventDecoder;
 
 #[cfg(feature = "tui")]
 mod tui;
@@ -91,42 +94,18 @@ fn button_event(code: KeyCode) -> bool {
     )
 }
 
-fn event_kind(event: &InputEvent) -> Option<&'static str> {
-    match event.event_type() {
-        EventType::KEY if button_event(KeyCode::new(event.code())) => Some("button"),
-        EventType::ABSOLUTE => {
-            let axis = AbsoluteAxisCode(event.code());
-            match axis {
-                AbsoluteAxisCode::ABS_X
-                | AbsoluteAxisCode::ABS_Y
-                | AbsoluteAxisCode::ABS_RX
-                | AbsoluteAxisCode::ABS_RY => Some("joystick"),
-                AbsoluteAxisCode::ABS_Z | AbsoluteAxisCode::ABS_RZ => Some("trigger"),
-                // The D-pad is exposed as a hat switch by this kernel/driver
-                // combination rather than as KEY_* or BTN_DPAD_* events.
-                AbsoluteAxisCode::ABS_HAT0X | AbsoluteAxisCode::ABS_HAT0Y => Some("button"),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
 fn read_device(path: String, mut device: Device, output: Arc<Mutex<()>>) {
     print_device_info(&path, &device);
+    let mut decoder = EventDecoder::new(&device);
 
     loop {
         match device.fetch_events() {
             Ok(events) => {
-                for event in events {
-                    let Some(kind) = event_kind(&event) else {
-                        continue;
-                    };
-
-                    // `InputEvent`'s Debug implementation decodes known event and code
-                    // names, while retaining the raw integer value.
-                    let _guard = output.lock().expect("output lock poisoned");
-                    println!("[{path}] {kind}: {event:?}");
+                for raw_event in events {
+                    for event in decoder.decode(raw_event) {
+                        let _guard = output.lock().expect("output lock poisoned");
+                        println!("[{path}] {event:?}");
+                    }
                 }
             }
             Err(error) => {
