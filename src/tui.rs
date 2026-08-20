@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph},
+    widgets::{Block, Borders, Clear, Gauge, Paragraph},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1116,6 +1116,60 @@ fn render_microphone(frame: &mut Frame<'_>, area: Rect, state: &ControllerState)
     );
 }
 
+fn render_mapping_overlay(frame: &mut Frame<'_>) {
+    let screen = frame.area();
+    let popup = Rect {
+        x: screen.x.saturating_add(2),
+        y: screen.y.saturating_add(2),
+        width: screen.width.saturating_sub(4),
+        height: screen.height.saturating_sub(4),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Keyboard mappings  (m: close)");
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+    let left = vec![
+        Line::from(Span::styled("BASE", active_style())),
+        Line::from("△  Ctrl+U"),
+        Line::from("×  Ctrl+E"),
+        Line::from("□  no mapping"),
+        Line::from("○  no mapping"),
+        Line::from("D-pad ↑  Alt+↑"),
+        Line::from("D-pad ↓  Alt+↓"),
+        Line::from("D-pad ←  Alt+←"),
+        Line::from("D-pad →  Alt+→"),
+        Line::from("L1 / R1  layer modifiers"),
+        Line::from("L2 / R2  no mapping"),
+    ];
+    let right = vec![
+        Line::from(Span::styled("LAYERS", active_style())),
+        Line::from("L1 + □  N    L1 + ○  I"),
+        Line::from("L1 + △  U    L1 + ×  E"),
+        Line::from("R1 + ↑  P I Enter (sequence)"),
+        Line::from("R1 + ↓  Ctrl+W"),
+        Line::from("R1 + ←  Alt+G"),
+        Line::from("R1 + →  Ctrl+T"),
+        Line::from(Span::styled("STICKS", active_style())),
+        Line::from("Left stick  Meta+N/I/U/E"),
+        Line::from("R1 + left stick  Meta+←/→/U/E"),
+        Line::from("Right stick  mouse scroll"),
+        Line::from("L3 / R3, triggers, Create/PS/Options: none"),
+        Line::from("Targets use logical QWERTY; Colemak compensation applies."),
+    ];
+    frame.render_widget(Paragraph::new(left), columns[0]);
+    frame.render_widget(
+        Paragraph::new(right).wrap(ratatui::widgets::Wrap { trim: true }),
+        columns[1],
+    );
+}
+
 fn render_trigger(frame: &mut Frame<'_>, area: Rect, title: &str, axis: AxisState) {
     let label = format!("{:>3}% ({})", axis.percent(), axis.value);
     let gauge = Gauge::default()
@@ -1234,7 +1288,12 @@ fn render_center_info(
     );
 }
 
-fn draw(frame: &mut Frame<'_>, state: &ControllerState, calibration: Option<&CalibrationSession>) {
+fn draw(
+    frame: &mut Frame<'_>,
+    state: &ControllerState,
+    calibration: Option<&CalibrationSession>,
+    show_mappings: bool,
+) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1326,10 +1385,13 @@ fn draw(frame: &mut Frame<'_>, state: &ControllerState, calibration: Option<&Cal
     );
 
     let footer = Paragraph::new(
-        "c: calibrate  Enter: advance/save  r/R g/G b/B: light -/+  0: off  q/Esc: exit",
+        "m: mappings  c: calibrate  Enter: advance/save  r/R g/G b/B: light -/+  0: off  q/Esc: exit",
     )
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, outer[3]);
+    if show_mappings {
+        render_mapping_overlay(frame);
+    }
 }
 
 fn run_app(
@@ -1338,6 +1400,7 @@ fn run_app(
     mut state: ControllerState,
 ) -> io::Result<()> {
     let mut calibration: Option<CalibrationSession> = None;
+    let mut show_mappings = false;
 
     loop {
         while let Ok(message) = receiver.try_recv() {
@@ -1364,12 +1427,13 @@ fn run_app(
         if let Some(session) = calibration.as_mut() {
             session.sample(&state);
         }
-        terminal.draw(|frame| draw(frame, &state, calibration.as_ref()))?;
+        terminal.draw(|frame| draw(frame, &state, calibration.as_ref(), show_mappings))?;
 
         if event::poll(Duration::from_millis(50))? {
             if let TerminalEvent::Key(key) = event::read()? {
                 match key.code {
                     TerminalKeyCode::Esc | TerminalKeyCode::Char('q') => return Ok(()),
+                    TerminalKeyCode::Char('m') => show_mappings = !show_mappings,
                     TerminalKeyCode::Char('c') => {
                         calibration = Some(CalibrationSession::new(&state));
                         state.calibration_message = None;
