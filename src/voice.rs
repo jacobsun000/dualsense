@@ -2,8 +2,8 @@
 //!
 //! Holding the right face button (○) captures the controller microphone, streams 24 kHz PCM audio to
 //! OpenAI's realtime transcription session, and returns transcript updates to the
-//! input reader. Text is sent through Wayland's virtual keyboard protocol so Unicode
-//! is supported without changing the user's clipboard.
+//! input reader. Text is pasted through Wayland with Unicode support, and the user's
+//! clipboard is restored after each completed turn.
 
 use crate::input::ControllerEvent;
 #[cfg(feature = "voice")]
@@ -19,6 +19,7 @@ mod enabled {
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
     use std::ffi::CString;
+    use std::io::Read;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -31,8 +32,22 @@ mod enabled {
         MaybeTlsStream, WebSocketStream, connect_async,
         tungstenite::{Message, client::IntoClientRequest},
     };
+    use wl_clipboard_rs::{
+        copy::{
+            ClipboardType as CopyClipboardType, MimeSource, MimeType as CopyMimeType, Options,
+            Seat as CopySeat, ServeRequests, Source, clear, copy, copy_multi,
+        },
+        paste::{
+            ClipboardType as PasteClipboardType, Error as PasteError, MimeType as PasteMimeType,
+            Seat as PasteSeat, get_contents, get_mime_types_ordered,
+        },
+    };
+    use wrtype::{Modifier, WrtypeClient};
 
     const INPUT_RATE: u32 = 24_000;
+    const WAYLAND_TYPE_DELAY: Duration = Duration::from_millis(10);
+    const CLIPBOARD_READY_DELAY: Duration = Duration::from_millis(10);
+    const CLIPBOARD_PASTE_DELAY: Duration = Duration::from_millis(30);
     const VOICE_BUTTON: Button = Button::East;
 
     #[derive(Debug)]
@@ -44,53 +59,224 @@ mod enabled {
         Light([u8; 3]),
     }
 
+    struct ClipboardSnapshot {
+        sources: Vec<MimeSource>,
+    }
+
+    impl ClipboardSnapshot {
+        fn capture() -> Result<Self, String> {
+            let mime_types =
+                match get_mime_types_ordered(PasteClipboardType::Regular, PasteSeat::Unspecified) {
+                    Ok(mime_types) => mime_types,
+                    Err(PasteError::NoSeats)
+                    | Err(PasteError::ClipboardEmpty)
+                    | Err(PasteError::NoMimeType) => Vec::new(),
+                    Err(error) => return Err(error.to_string()),
+                };
+            let mut sources = Vec::with_capacity(mime_types.len());
+            for mime_type in mime_types {
+                let (mut pipe, actual_mime_type) = get_contents(
+                    PasteClipboardType::Regular,
+                    PasteSeat::Unspecified,
+                    PasteMimeType::Specific(&mime_type),
+                )
+                .map_err(|error| error.to_string())?;
+                let mut data = Vec::new();
+                pipe.read_to_end(&mut data)
+                    .map_err(|error| error.to_string())?;
+                sources.push(MimeSource {
+                    source: Source::Bytes(data.into_boxed_slice()),
+                    mime_type: CopyMimeType::Specific(actual_mime_type),
+                });
+            }
+            Ok(Self { sources })
+        }
+
+        fn restore(self) -> Result<(), String> {
+            if self.sources.is_empty() {
+                clear(CopyClipboardType::Regular, CopySeat::All).map_err(|error| error.to_string())
+            } else {
+                copy_multi(Options::new(), self.sources).map_err(|error| error.to_string())
+            }
+        }
+    }
+
+    struct ClipboardSession {
+        snapshot: ClipboardSnapshot,
+    }
+
+    impl ClipboardSession {
+        fn new() -> Result<Self, String> {
+            Ok(Self {
+                snapshot: ClipboardSnapshot::capture()?,
+            })
+        }
+
+        fn paste(
+            &self,
+            text: &str,
+            client: &mut WrtypeClient,
+            paste_with_shift: bool,
+        ) -> io::Result<()> {
+            let mut options = Options::new();
+            options.serve_requests(ServeRequests::Only(1));
+            copy(
+                options,
+                Source::Bytes(text.as_bytes().to_vec().into_boxed_slice()),
+                CopyMimeType::Text,
+            )
+            .map_err(io::Error::other)?;
+            thread::sleep(CLIPBOARD_READY_DELAY);
+            let modifiers = if paste_with_shift {
+                [Modifier::Ctrl, Modifier::Shift].as_slice()
+            } else {
+                [Modifier::Ctrl].as_slice()
+            };
+            client
+                .send_shortcut(modifiers, "v")
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            thread::sleep(CLIPBOARD_PASTE_DELAY);
+            Ok(())
+        }
+
+        fn restore(self) -> io::Result<()> {
+            self.snapshot.restore().map_err(io::Error::other)
+        }
+    }
+
     struct TextInput {
-        client: Option<wrtype::WrtypeClient>,
+        client: Option<WrtypeClient>,
         attempted: bool,
         partial_seen: bool,
+        clipboard: Option<ClipboardSession>,
+        clipboard_disabled: bool,
+        paste_with_shift: bool,
     }
 
     impl Default for TextInput {
         fn default() -> Self {
+            let paste_with_shift = !matches!(
+                std::env::var("DUALSENSE_VOICE_PASTE").as_deref(),
+                Ok("ctrl-v") | Ok("ctrl_v") | Ok("control-v") | Ok("control_v")
+            );
             Self {
                 client: None,
                 attempted: false,
                 partial_seen: false,
+                clipboard: None,
+                clipboard_disabled: false,
+                paste_with_shift,
             }
         }
     }
 
     impl TextInput {
+        fn ensure_client(&mut self, output: &mpsc::Sender<VoiceOutput>) -> bool {
+            if self.attempted {
+                return self.client.is_some();
+            }
+            self.attempted = true;
+            match WrtypeClient::new() {
+                Ok(client) => {
+                    self.client = Some(client);
+                    let _ = output.send(VoiceOutput::Status(
+                        "Using Wayland virtual keyboard for transcription".to_owned(),
+                    ));
+                    true
+                }
+                Err(error) => {
+                    let _ = output.send(VoiceOutput::Status(format!(
+                        "Wayland virtual keyboard unavailable; falling back to raw keyboard input: {error}"
+                    )));
+                    false
+                }
+            }
+        }
+
+        fn restore_clipboard(&mut self, output: &mpsc::Sender<VoiceOutput>) {
+            let Some(session) = self.clipboard.take() else {
+                return;
+            };
+            if let Err(error) = session.restore() {
+                let _ = output.send(VoiceOutput::Status(format!(
+                    "Could not restore clipboard: {error}"
+                )));
+            }
+        }
+
+        fn begin_turn(&mut self, output: &mpsc::Sender<VoiceOutput>) {
+            self.restore_clipboard(output);
+            self.partial_seen = false;
+        }
+
+        fn type_wayland(
+            &mut self,
+            text: &str,
+            output: &mpsc::Sender<VoiceOutput>,
+        ) -> io::Result<bool> {
+            if !self.ensure_client(output) {
+                return Ok(false);
+            }
+            let Some(client) = self.client.as_mut() else {
+                return Ok(false);
+            };
+            client
+                .type_text_with_delay(text, WAYLAND_TYPE_DELAY)
+                .map(|()| true)
+                .map_err(|error| io::Error::other(error.to_string()))
+        }
+
         fn type_text(
             &mut self,
             text: &str,
             output: &mpsc::Sender<VoiceOutput>,
         ) -> io::Result<bool> {
-            if !self.attempted {
-                self.attempted = true;
-                match wrtype::WrtypeClient::new() {
-                    Ok(client) => {
-                        self.client = Some(client);
-                        let _ = output.send(VoiceOutput::Status(
-                            "Using Wayland virtual keyboard for transcription".to_owned(),
-                        ));
+            if !self.clipboard_disabled && self.clipboard.is_none() {
+                match ClipboardSession::new() {
+                    Ok(session) => {
+                        self.clipboard = Some(session);
+                        let shortcut = if self.paste_with_shift {
+                            "Ctrl+Shift+V"
+                        } else {
+                            "Ctrl+V"
+                        };
+                        let _ = output.send(VoiceOutput::Status(format!(
+                            "Using clipboard paste ({shortcut}) for transcription"
+                        )));
                     }
                     Err(error) => {
+                        self.clipboard_disabled = true;
                         let _ = output.send(VoiceOutput::Status(format!(
-                            "Wayland virtual keyboard unavailable; falling back to raw keyboard input: {error}"
+                            "Clipboard unavailable; using paced Wayland keyboard input: {error}"
                         )));
-                        return Ok(false);
                     }
                 }
             }
 
-            let Some(client) = self.client.as_mut() else {
-                return Ok(false);
-            };
-            client
-                .type_text(text)
-                .map(|()| true)
-                .map_err(|error| io::Error::other(error.to_string()))
+            if self.clipboard.is_some() {
+                if !self.ensure_client(output) {
+                    self.clipboard_disabled = true;
+                    self.restore_clipboard(output);
+                } else {
+                    let result = {
+                        let client = self.client.as_mut().expect("Wayland client exists");
+                        let session = self.clipboard.as_ref().expect("clipboard session exists");
+                        session.paste(text, client, self.paste_with_shift)
+                    };
+                    match result {
+                        Ok(()) => return Ok(true),
+                        Err(error) => {
+                            self.clipboard_disabled = true;
+                            self.restore_clipboard(output);
+                            let _ = output.send(VoiceOutput::Status(format!(
+                                "Clipboard paste failed; using paced Wayland keyboard input: {error}"
+                            )));
+                        }
+                    }
+                }
+            }
+
+            self.type_wayland(text, output)
         }
     }
 
@@ -207,30 +393,32 @@ mod enabled {
 
         fn begin_text_turn(&self) {
             let mut input = self.text_input.lock().expect("text input lock poisoned");
-            input.partial_seen = false;
+            input.begin_turn(&self.output_sender);
         }
 
-        /// Type a transcript delta through Wayland's virtual keyboard.
-        ///
-        /// Returns `false` when the compositor does not expose the virtual
-        /// keyboard protocol, allowing callers to use the existing uinput
-        /// keyboard as a fallback for text it can represent.
+        /// Paste a transcript delta immediately. Returns `false` when both
+        /// clipboard paste and the Wayland virtual keyboard are unavailable,
+        /// allowing callers to use the existing uinput keyboard as a fallback.
         pub fn type_partial(&self, text: &str) -> io::Result<bool> {
             let mut input = self.text_input.lock().expect("text input lock poisoned");
             input.partial_seen = true;
             input.type_text(text, &self.output_sender)
         }
 
-        /// Type a final transcript unless partial deltas have already been
-        /// emitted for this turn. The deltas are incremental, so typing the
-        /// final transcript again would duplicate the text.
+        /// Paste a final transcript unless partial deltas have already been
+        /// emitted for this turn. Restore the user's clipboard afterward.
         pub fn type_final(&self, text: &str) -> io::Result<bool> {
             let mut input = self.text_input.lock().expect("text input lock poisoned");
             if input.partial_seen {
                 input.partial_seen = false;
+                input.restore_clipboard(&self.output_sender);
                 return Ok(true);
             }
-            input.type_text(text, &self.output_sender)
+            let typed = input.type_text(text, &self.output_sender)?;
+            if typed {
+                input.restore_clipboard(&self.output_sender);
+            }
+            Ok(typed)
         }
 
         fn set_light(&self, rgb: [u8; 3]) {
