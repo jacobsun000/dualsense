@@ -48,6 +48,7 @@ mod enabled {
     const WAYLAND_TYPE_DELAY: Duration = Duration::from_millis(10);
     const CLIPBOARD_READY_DELAY: Duration = Duration::from_millis(10);
     const CLIPBOARD_PASTE_DELAY: Duration = Duration::from_millis(30);
+    const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
     const VOICE_BUTTON: Button = Button::East;
 
     #[derive(Debug)]
@@ -446,12 +447,14 @@ mod enabled {
     ) {
         let mut socket: Option<Socket> = None;
         let mut recording = false;
+        let mut idle_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         let mut resampler = Resampler::default();
         let api_key = std::env::var("OPENAI_API_KEY").ok();
         let mut warned_missing_key = false;
 
         loop {
             if socket.is_none() {
+                idle_timer = None;
                 let Some(command) = commands.recv().await else {
                     return;
                 };
@@ -488,19 +491,46 @@ mod enabled {
                 continue;
             }
 
-            let ready = tokio::select! {
-                command = commands.recv() => Some((command, None)),
-                incoming = async {
-                    socket.as_mut().expect("socket exists").next().await
-                } => Some((None, incoming)),
+            let ready = if let Some(timer) = idle_timer.as_mut() {
+                tokio::select! {
+                    command = commands.recv() => Some((command, None, false)),
+                    incoming = async {
+                        socket.as_mut().expect("socket exists").next().await
+                    } => Some((None, incoming, false)),
+                    _ = timer.as_mut() => Some((None, None, true)),
+                }
+            } else {
+                tokio::select! {
+                    command = commands.recv() => Some((command, None, false)),
+                    incoming = async {
+                        socket.as_mut().expect("socket exists").next().await
+                    } => Some((None, incoming, false)),
+                }
             };
-            let Some((command, incoming)) = ready else {
+            let Some((command, incoming, idle_expired)) = ready else {
                 return;
             };
+            if idle_expired {
+                if let Some(mut socket) = socket.take() {
+                    let _ = socket.send(Message::Close(None)).await;
+                }
+                recording = false;
+                idle_timer = None;
+                let _ = output.send(VoiceOutput::Status(
+                    "Voice transcription session closed after 5 seconds idle".to_owned(),
+                ));
+                continue;
+            }
+            if command.is_none() && incoming.is_none() {
+                return;
+            }
 
             if let Some(command) = command {
                 match command {
-                    WorkerMessage::Start => recording = true,
+                    WorkerMessage::Start => {
+                        recording = true;
+                        idle_timer = None;
+                    }
                     WorkerMessage::Stop => {
                         recording = false;
                         if let Some(socket) = socket.as_mut()
@@ -515,6 +545,7 @@ mod enabled {
                             let _ = output
                                 .send(VoiceOutput::Status(format!("Voice commit failed: {error}")));
                         }
+                        idle_timer = Some(Box::pin(tokio::time::sleep(SESSION_IDLE_TIMEOUT)));
                     }
                     WorkerMessage::Audio(chunk) if recording => {
                         let pcm = resampler.convert(chunk);
@@ -538,6 +569,7 @@ mod enabled {
                                     "Voice audio send failed: {error}"
                                 )));
                                 socket = None;
+                                idle_timer = None;
                                 recording = false;
                             }
                         }
@@ -556,6 +588,7 @@ mod enabled {
                             "Voice transcription disconnected".to_owned(),
                         ));
                         socket = None;
+                        idle_timer = None;
                         recording = false;
                     }
                     Ok(_) => {}
