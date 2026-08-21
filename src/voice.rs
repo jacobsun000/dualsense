@@ -45,22 +45,12 @@ mod enabled {
         Light([u8; 3]),
     }
 
+    #[derive(Default)]
     struct TextInput {
         client: Option<WrtypeClient>,
         attempted: bool,
         partial_seen: bool,
         partial_typed: bool,
-    }
-
-    impl Default for TextInput {
-        fn default() -> Self {
-            Self {
-                client: None,
-                attempted: false,
-                partial_seen: false,
-                partial_typed: false,
-            }
-        }
     }
 
     impl TextInput {
@@ -99,7 +89,7 @@ mod enabled {
             self.partial_typed = false;
         }
 
-        fn type_wayland(&mut self, text: &str, output: &mpsc::Sender<VoiceOutput>) -> Result<bool> {
+        fn type_text(&mut self, text: &str, output: &mpsc::Sender<VoiceOutput>) -> Result<bool> {
             if !self.ensure_client(output) {
                 return Ok(false);
             }
@@ -113,10 +103,6 @@ mod enabled {
                 .type_text(text)
                 .map(|()| true)
                 .map_err(|error| anyhow!(error))
-        }
-
-        fn type_text(&mut self, text: &str, output: &mpsc::Sender<VoiceOutput>) -> Result<bool> {
-            self.type_wayland(text, output)
         }
     }
 
@@ -270,7 +256,7 @@ mod enabled {
             // The text-input mutex is held while wrtype sends this complete
             // delta, preventing concurrent partials from overtaking one another.
             input.partial_seen = true;
-            match input.type_wayland(text, &self.output_sender)? {
+            match input.type_text(text, &self.output_sender)? {
                 true => {
                     input.partial_typed = true;
                     Ok(true)
