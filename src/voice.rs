@@ -2,8 +2,7 @@
 //!
 //! Holding the right face button (○) captures the controller microphone, streams 24 kHz PCM audio to
 //! OpenAI's realtime transcription session, and returns transcript updates to the
-//! input reader. Text is pasted through Wayland with Unicode support, and the user's
-//! clipboard is restored after each completed turn.
+//! input reader. Text is entered through Wayland with Unicode support.
 
 use crate::input::ControllerEvent;
 #[cfg(feature = "voice")]
@@ -19,7 +18,6 @@ mod enabled {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
-    use std::io::Read;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -32,27 +30,12 @@ mod enabled {
         MaybeTlsStream, WebSocketStream, connect_async,
         tungstenite::{Message, client::IntoClientRequest},
     };
-    use wl_clipboard_rs::{
-        copy::{
-            ClipboardType as CopyClipboardType, MimeSource, MimeType as CopyMimeType, Options,
-            Seat as CopySeat, ServeRequests, Source, clear, copy, copy_multi,
-        },
-        paste::{
-            ClipboardType as PasteClipboardType, Error as PasteError, MimeType as PasteMimeType,
-            Seat as PasteSeat, get_contents, get_mime_types_ordered,
-        },
-    };
-    use wrtype::{Modifier, WrtypeClient};
+    use wrtype::WrtypeClient;
 
     const INPUT_RATE: u32 = 24_000;
-    // Kitty and other terminal emulators can be busy processing a paste while
-    // the next clipboard owner is installed.  Partial transcripts therefore
-    // use the compositor's virtual keyboard instead of repeatedly replacing
-    // the clipboard.  A small inter-character delay also keeps slower clients
-    // from dropping events.
+    // A small inter-character delay keeps slower Wayland clients from dropping
+    // events while wrtype sends transcript text through the virtual keyboard.
     const WAYLAND_TYPE_DELAY: Duration = Duration::from_millis(20);
-    const CLIPBOARD_READY_DELAY: Duration = Duration::from_millis(10);
-    const CLIPBOARD_PASTE_DELAY: Duration = Duration::from_millis(30);
     const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
     const VOICE_BUTTON: Button = Button::East;
 
@@ -65,119 +48,20 @@ mod enabled {
         Light([u8; 3]),
     }
 
-    struct ClipboardSnapshot {
-        sources: Vec<MimeSource>,
-    }
-
-    impl ClipboardSnapshot {
-        fn capture() -> Result<Self> {
-            let mime_types =
-                match get_mime_types_ordered(PasteClipboardType::Regular, PasteSeat::Unspecified) {
-                    Ok(mime_types) => mime_types,
-                    Err(PasteError::NoSeats)
-                    | Err(PasteError::ClipboardEmpty)
-                    | Err(PasteError::NoMimeType) => Vec::new(),
-                    Err(error) => return Err(anyhow!(error)),
-                };
-            let mut sources = Vec::with_capacity(mime_types.len());
-            for mime_type in mime_types {
-                let (mut pipe, actual_mime_type) = get_contents(
-                    PasteClipboardType::Regular,
-                    PasteSeat::Unspecified,
-                    PasteMimeType::Specific(&mime_type),
-                )
-                .map_err(|error| anyhow!(error))?;
-                let mut data = Vec::new();
-                pipe.read_to_end(&mut data)
-                    .map_err(|error| anyhow!(error))?;
-                sources.push(MimeSource {
-                    source: Source::Bytes(data.into_boxed_slice()),
-                    mime_type: CopyMimeType::Specific(actual_mime_type),
-                });
-            }
-            Ok(Self { sources })
-        }
-
-        fn restore(self) -> Result<()> {
-            if self.sources.is_empty() {
-                clear(CopyClipboardType::Regular, CopySeat::All).map_err(|error| anyhow!(error))
-            } else {
-                copy_multi(Options::new(), self.sources).map_err(|error| anyhow!(error))
-            }
-        }
-    }
-
-    struct ClipboardSession {
-        snapshot: ClipboardSnapshot,
-    }
-
-    impl ClipboardSession {
-        fn new() -> Result<Self> {
-            Ok(Self {
-                snapshot: ClipboardSnapshot::capture()?,
-            })
-        }
-
-        fn paste(
-            &self,
-            text: &str,
-            client: &mut WrtypeClient,
-            paste_with_shift: bool,
-        ) -> Result<()> {
-            // Keep the data source alive until another copy replaces it. A
-            // clipboard manager may request the data before the target app
-            // receives the paste shortcut; limiting this to one request can
-            // therefore consume the source before the actual paste.
-            let mut options = Options::new();
-            options.serve_requests(ServeRequests::Unlimited);
-            copy(
-                options,
-                Source::Bytes(text.as_bytes().to_vec().into_boxed_slice()),
-                CopyMimeType::Text,
-            )
-            .map_err(|error| anyhow!(error))?;
-            thread::sleep(CLIPBOARD_READY_DELAY);
-            let modifiers = if paste_with_shift {
-                [Modifier::Ctrl, Modifier::Shift].as_slice()
-            } else {
-                [Modifier::Ctrl].as_slice()
-            };
-            client
-                .send_shortcut(modifiers, "v")
-                .map_err(|error| anyhow!(error))?;
-            thread::sleep(CLIPBOARD_PASTE_DELAY);
-            Ok(())
-        }
-
-        fn restore(self) -> Result<()> {
-            self.snapshot.restore()
-        }
-    }
-
     struct TextInput {
         client: Option<WrtypeClient>,
         attempted: bool,
         partial_seen: bool,
         partial_typed: bool,
-        clipboard: Option<ClipboardSession>,
-        clipboard_disabled: bool,
-        paste_with_shift: bool,
     }
 
     impl Default for TextInput {
         fn default() -> Self {
-            let paste_with_shift = !matches!(
-                std::env::var("DUALSENSE_VOICE_PASTE").as_deref(),
-                Ok("ctrl-v") | Ok("ctrl_v") | Ok("control-v") | Ok("control_v")
-            );
             Self {
                 client: None,
                 attempted: false,
                 partial_seen: false,
                 partial_typed: false,
-                clipboard: None,
-                clipboard_disabled: false,
-                paste_with_shift,
             }
         }
     }
@@ -213,19 +97,7 @@ mod enabled {
             }
         }
 
-        fn restore_clipboard(&mut self, output: &mpsc::Sender<VoiceOutput>) {
-            let Some(session) = self.clipboard.take() else {
-                return;
-            };
-            if let Err(error) = session.restore() {
-                let _ = output.send(VoiceOutput::Status(format!(
-                    "Could not restore clipboard: {error}"
-                )));
-            }
-        }
-
-        fn begin_turn(&mut self, output: &mpsc::Sender<VoiceOutput>) {
-            self.restore_clipboard(output);
+        fn begin_turn(&mut self) {
             self.partial_seen = false;
             self.partial_typed = false;
         }
@@ -244,55 +116,6 @@ mod enabled {
         }
 
         fn type_text(&mut self, text: &str, output: &mpsc::Sender<VoiceOutput>) -> Result<bool> {
-            if !self.clipboard_disabled && self.clipboard.is_none() {
-                match ClipboardSession::new() {
-                    Ok(session) => {
-                        self.clipboard = Some(session);
-                        let shortcut = if self.paste_with_shift {
-                            "Ctrl+Shift+V"
-                        } else {
-                            "Ctrl+V"
-                        };
-                        let _ = output.send(VoiceOutput::Status(format!(
-                            "Using clipboard paste ({shortcut}) for transcription"
-                        )));
-                    }
-                    Err(error) => {
-                        self.clipboard_disabled = true;
-                        let _ = output.send(VoiceOutput::Status(format!(
-                            "Clipboard unavailable; using paced Wayland keyboard input: {error}"
-                        )));
-                    }
-                }
-            }
-
-            if self.clipboard.is_some() {
-                if !self.ensure_client(output) {
-                    self.clipboard_disabled = true;
-                    self.restore_clipboard(output);
-                } else {
-                    let result = {
-                        let Some(client) = self.client.as_mut() else {
-                            return self.type_wayland(text, output);
-                        };
-                        let Some(session) = self.clipboard.as_ref() else {
-                            return self.type_wayland(text, output);
-                        };
-                        session.paste(text, client, self.paste_with_shift)
-                    };
-                    match result {
-                        Ok(()) => return Ok(true),
-                        Err(error) => {
-                            self.clipboard_disabled = true;
-                            self.restore_clipboard(output);
-                            let _ = output.send(VoiceOutput::Status(format!(
-                                "Clipboard paste failed; using paced Wayland keyboard input: {error}"
-                            )));
-                        }
-                    }
-                }
-            }
-
             self.type_wayland(text, output)
         }
     }
@@ -431,25 +254,21 @@ mod enabled {
                 ));
                 return;
             };
-            input.begin_turn(&self.output_sender);
+            input.begin_turn();
         }
 
         /// Deliver a transcript delta through the ordered virtual keyboard.
         ///
-        /// If that protocol is unavailable, the delta is deferred and the
-        /// final transcript is entered once through the fallback path.
+        /// If wrtype is unavailable, the delta is deferred and the final
+        /// transcript is attempted once through the normal fallback path.
         pub fn type_partial(&self, text: &str) -> Result<bool> {
             let mut input = self
                 .text_input
                 .lock()
                 .map_err(|_| anyhow!("voice text-input state is unavailable"))?;
 
-            // Never replace the clipboard for every realtime delta.  Clipboard
-            // ownership and the target application's paste request are
-            // asynchronous; when the next delta arrives first, Kitty can read
-            // the wrong source (or no source at all).  The virtual keyboard
-            // protocol gives us ordered key events and wrtype round-trips each
-            // event before continuing.
+            // wrtype gives us ordered key events and round-trips each event
+            // before continuing, so realtime deltas can be entered directly.
             input.partial_seen = true;
             match input.type_wayland(text, &self.output_sender)? {
                 true => {
@@ -457,12 +276,8 @@ mod enabled {
                     Ok(true)
                 }
                 false => {
-                    // Do not fall back to one clipboard paste per delta.  Let
-                    // the final, authoritative transcript be pasted once
-                    // instead.  Returning true tells the caller that this
-                    // delta is intentionally deferred rather than asking the
-                    // raw uinput mapper to type it and then duplicating it at
-                    // completion.
+                    // Defer the delta rather than asking the raw uinput
+                    // mapper to type it and then duplicating it at completion.
                     Ok(true)
                 }
             }
@@ -471,9 +286,9 @@ mod enabled {
         /// Complete a transcript turn without duplicating streamed deltas.
         ///
         /// When virtual-keyboard delivery was unavailable, partials were
-        /// deferred and this final transcript is delivered once through the
-        /// normal fallback path.  When all partials were typed, the final API
-        /// event is only an acknowledgement and must not be entered again.
+        /// deferred and this final transcript is delivered once through wrtype
+        /// (or the raw uinput fallback). When all partials were typed, the
+        /// final API event is only an acknowledgement.
         pub fn type_final(&self, text: &str) -> Result<bool> {
             let mut input = self
                 .text_input
@@ -484,22 +299,13 @@ mod enabled {
                 input.partial_seen = false;
                 input.partial_typed = false;
                 if partial_typed {
-                    input.restore_clipboard(&self.output_sender);
                     return Ok(true);
                 }
 
-                let typed = input.type_text(text, &self.output_sender)?;
-                if typed {
-                    input.restore_clipboard(&self.output_sender);
-                }
-                return Ok(typed);
+                return input.type_text(text, &self.output_sender);
             }
 
-            let typed = input.type_text(text, &self.output_sender)?;
-            if typed {
-                input.restore_clipboard(&self.output_sender);
-            }
-            Ok(typed)
+            input.type_text(text, &self.output_sender)
         }
 
         fn set_light(&self, rgb: [u8; 3]) {

@@ -40,8 +40,8 @@ fn usage() {
          Use --light to change the controller RGB indicator; optionally pass\n\
          an event device path after the color.\n\
          Hold the right face button (○) to dictate through OPENAI_API_KEY;\n\
-         partial transcript text is pasted as it arrives. Clipboard paste uses\n\
-         Ctrl+Shift+V by default; set DUALSENSE_VOICE_PASTE=ctrl-v when needed.\n\
+         partial transcript text is entered as it arrives through the Wayland\n\
+         virtual keyboard.\n\
          Environment variables can also be placed in .env; shell values take precedence.\n\
          Use --tui (with the tui feature) for an interactive status screen.\n\n\
          Examples:\n\
