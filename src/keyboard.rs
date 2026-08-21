@@ -4,6 +4,7 @@
 //! uinput events. It is intentionally independent of the TUI, so the same
 //! mapping is active in both direct and TUI modes.
 
+use crate::focus::FocusedApp;
 use crate::input::{Button, ButtonState, ControllerEvent, ControllerEventKind, Stick, StickAxis};
 use crate::keymap::{ControllerInput, DEFAULT_KEYMAP, Direction, KeyAction, KeyStroke, Keymap};
 use evdev::uinput::VirtualDevice;
@@ -27,6 +28,7 @@ pub struct KeyboardMapper {
     keyboard: VirtualDevice,
     mouse: VirtualDevice,
     keymap: Keymap,
+    focused_app: Option<FocusedApp>,
     active_layers: HashSet<Button>,
     left_x: f32,
     left_y: f32,
@@ -70,6 +72,7 @@ impl KeyboardMapper {
             keyboard,
             mouse,
             keymap,
+            focused_app: None,
             active_layers: HashSet::new(),
             left_x: 0.0,
             left_y: 0.0,
@@ -86,6 +89,13 @@ impl KeyboardMapper {
 
     pub fn tick(&mut self) -> io::Result<()> {
         self.emit_scroll()
+    }
+
+    /// Update the focused app used by the next application-specific mapper.
+    pub fn set_focused_app(&mut self, focused_app: Option<FocusedApp>) {
+        if self.focused_app != focused_app {
+            self.focused_app = focused_app;
+        }
     }
 
     /// Type text through the virtual keyboard. Letter keycodes are translated

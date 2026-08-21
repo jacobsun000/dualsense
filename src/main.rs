@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::{env, io};
 
+mod focus;
+use focus::FocusMonitor;
 mod input;
 use input::{ControllerEventKind, EventDecoder};
 mod keymap;
@@ -37,6 +39,7 @@ fn usage() {
          Hold the right face button (○) to dictate through OPENAI_API_KEY;\n\
          partial transcript text is pasted as it arrives. Clipboard paste uses\n\
          Ctrl+Shift+V by default; set DUALSENSE_VOICE_PASTE=ctrl-v when needed.\n\
+         Environment variables can also be placed in .env; shell values take precedence.\n\
          Use --tui (with the tui feature) for an interactive status screen.\n\n\
          Examples:\n\
            dualsense\n\
@@ -148,6 +151,7 @@ fn read_device(
     output: Arc<Mutex<()>>,
     mut mapper: KeyboardMapper,
     voice: VoiceInput,
+    focus: Option<FocusMonitor>,
 ) {
     print_device_info(&path, &device);
     if let Err(error) = device.set_nonblocking(true) {
@@ -157,6 +161,9 @@ fn read_device(
     let mut decoder = EventDecoder::new(&device);
 
     loop {
+        if let Some(focus) = focus.as_ref() {
+            mapper.set_focused_app(focus.current());
+        }
         if let Err(error) = drain_voice_outputs(&path, &voice, &mut mapper, &output) {
             let _guard = output.lock().expect("output lock poisoned");
             eprintln!("[{path}] voice input stopped: {error}");
@@ -196,7 +203,19 @@ fn read_device(
     }
 }
 
+fn load_environment() {
+    if let Err(error) = dotenvy::dotenv()
+        && !error.not_found()
+    {
+        eprintln!("Could not load .env: {error}");
+    }
+}
+
 fn main() {
+    // Load local development settings before any voice worker reads them.
+    // Existing process environment variables remain the source of truth.
+    load_environment();
+
     let args: Vec<_> = env::args_os().skip(1).collect();
 
     if args.first().is_some_and(|arg| arg == "--light") {
@@ -295,6 +314,13 @@ fn main() {
 
     let output = Arc::new(Mutex::new(()));
     let mut workers = Vec::new();
+    let focus = match FocusMonitor::start() {
+        Ok(focus) => focus,
+        Err(error) => {
+            eprintln!("Focused app detection unavailable: {error}");
+            None
+        }
+    };
 
     if let Some(arg) = args.first() {
         if arg == "--list" {
@@ -345,7 +371,7 @@ fn main() {
                 let path = path.display().to_string();
                 workers.push(thread::spawn({
                     let output = Arc::clone(&output);
-                    move || read_device(path, device, output, mapper, voice)
+                    move || read_device(path, device, output, mapper, voice, focus)
                 }));
             }
             Err(error) => {
@@ -383,9 +409,10 @@ fn main() {
             };
             let path = path.display().to_string();
             let voice = voice.clone();
+            let worker_focus = focus.clone();
             workers.push(thread::spawn({
                 let output = Arc::clone(&output);
-                move || read_device(path, device, output, mapper, voice)
+                move || read_device(path, device, output, mapper, voice, worker_focus)
             }));
         }
 

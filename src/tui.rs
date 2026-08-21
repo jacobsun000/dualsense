@@ -1,3 +1,4 @@
+use crate::focus::FocusMonitor;
 use crate::input::{Button, ControllerEvent, EventDecoder};
 use crate::keyboard::KeyboardMapper;
 use crate::keymap::{
@@ -583,6 +584,7 @@ fn spawn_reader(
     sender: Sender<ReaderMessage>,
     mut mapper: KeyboardMapper,
     voice: VoiceInput,
+    focus: Option<FocusMonitor>,
 ) {
     thread::spawn(move || {
         if let Err(error) = device.set_nonblocking(true) {
@@ -591,6 +593,9 @@ fn spawn_reader(
         }
         let mut decoder = EventDecoder::new(&device);
         loop {
+            if let Some(focus) = focus.as_ref() {
+                mapper.set_focused_app(focus.current());
+            }
             if let Err(error) = drain_voice_outputs(&voice, &mut mapper, &sender) {
                 let _ = sender.send(ReaderMessage::Error(format!(
                     "Voice input stopped: {error}"
@@ -1313,7 +1318,14 @@ pub fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let state = ControllerState::new(path.display().to_string(), &device);
     let voice = VoiceInput::new(state.light.clone())?;
     let mapper = KeyboardMapper::new()?;
-    spawn_reader(device, sender.clone(), mapper, voice.clone());
+    let focus = match FocusMonitor::start() {
+        Ok(focus) => focus,
+        Err(error) => {
+            eprintln!("Focused app detection unavailable: {error}");
+            None
+        }
+    };
+    spawn_reader(device, sender.clone(), mapper, voice.clone(), focus);
     voice.spawn_microphone();
 
     enable_raw_mode()?;
