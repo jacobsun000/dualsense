@@ -191,14 +191,22 @@ mod enabled {
             match WrtypeClient::new() {
                 Ok(client) => {
                     self.client = Some(client);
-                    let _ = output.send(VoiceOutput::Status(
-                        "Using Wayland virtual keyboard for transcription".to_owned(),
-                    ));
+                    let display =
+                        std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".to_owned());
+                    let session =
+                        std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "<unset>".to_owned());
+                    let _ = output.send(VoiceOutput::Status(format!(
+                        "Wayland virtual keyboard: available (WAYLAND_DISPLAY={display}, XDG_SESSION_TYPE={session})"
+                    )));
                     true
                 }
                 Err(error) => {
+                    let display =
+                        std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".to_owned());
+                    let session =
+                        std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "<unset>".to_owned());
                     let _ = output.send(VoiceOutput::Status(format!(
-                        "Wayland virtual keyboard unavailable; deferring partials until the final transcript: {error}"
+                        "Wayland virtual keyboard: unavailable (WAYLAND_DISPLAY={display}, XDG_SESSION_TYPE={session}); deferring partials until the final transcript: {error}"
                     )));
                     false
                 }
@@ -352,6 +360,10 @@ mod enabled {
                 text_input: Arc::new(Mutex::new(TextInput::default())),
                 light,
             };
+            // Probe the compositor during startup so direct mode reports the
+            // actual text-input transport before the first voice turn. The
+            // successful client is retained for subsequent partials.
+            input.probe_text_input();
             input.set_light([0, 0, 255]);
             Ok(input)
         }
@@ -402,6 +414,11 @@ mod enabled {
         pub fn try_recv(&self) -> Option<VoiceOutput> {
             let receiver = self.outputs.lock().expect("voice output lock poisoned");
             receiver.try_recv().ok()
+        }
+
+        fn probe_text_input(&self) {
+            let mut input = self.text_input.lock().expect("text input lock poisoned");
+            let _ = input.ensure_client(&self.output_sender);
         }
 
         fn begin_text_turn(&self) {
