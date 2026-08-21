@@ -33,9 +33,6 @@ mod enabled {
     use wrtype::WrtypeClient;
 
     const INPUT_RATE: u32 = 24_000;
-    // A small inter-character delay keeps slower Wayland clients from dropping
-    // events while wrtype sends transcript text through the virtual keyboard.
-    const WAYLAND_TYPE_DELAY: Duration = Duration::from_millis(20);
     const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
     const VOICE_BUTTON: Button = Button::East;
 
@@ -109,8 +106,11 @@ mod enabled {
             let Some(client) = self.client.as_mut() else {
                 return Ok(false);
             };
+            // `text_input` is locked for the whole call by each public typing
+            // method, so multiple partials and the final transcript are sent
+            // synchronously and in order.
             client
-                .type_text_with_delay(text, WAYLAND_TYPE_DELAY)
+                .type_text(text)
                 .map(|()| true)
                 .map_err(|error| anyhow!(error))
         }
@@ -267,8 +267,8 @@ mod enabled {
                 .lock()
                 .map_err(|_| anyhow!("voice text-input state is unavailable"))?;
 
-            // wrtype gives us ordered key events and round-trips each event
-            // before continuing, so realtime deltas can be entered directly.
+            // The text-input mutex is held while wrtype sends this complete
+            // delta, preventing concurrent partials from overtaking one another.
             input.partial_seen = true;
             match input.type_wayland(text, &self.output_sender)? {
                 true => {
