@@ -174,6 +174,7 @@ const R1_DPAD_UP_SEQUENCE: &[KeyStroke] = &[
 const BASE_BUTTONS: &[Binding] = &[
     Binding::button(Button::North, KeyAction::combo(CTRL, KeyCode::KEY_U)),
     Binding::button(Button::South, KeyAction::combo(CTRL, KeyCode::KEY_E)),
+    Binding::button(Button::West, KeyAction::key(KeyCode::KEY_ENTER)),
     Binding::button(Button::DpadUp, KeyAction::combo(ALT, KeyCode::KEY_UP)),
     Binding::button(Button::DpadDown, KeyAction::combo(ALT, KeyCode::KEY_DOWN)),
     Binding::button(Button::DpadLeft, KeyAction::combo(ALT, KeyCode::KEY_LEFT)),
