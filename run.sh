@@ -1,1 +1,1 @@
-cargo run -- --tui
+cargo run
