@@ -45,7 +45,12 @@ mod enabled {
     use wrtype::{Modifier, WrtypeClient};
 
     const INPUT_RATE: u32 = 24_000;
-    const WAYLAND_TYPE_DELAY: Duration = Duration::from_millis(10);
+    // Kitty and other terminal emulators can be busy processing a paste while
+    // the next clipboard owner is installed.  Partial transcripts therefore
+    // use the compositor's virtual keyboard instead of repeatedly replacing
+    // the clipboard.  A small inter-character delay also keeps slower clients
+    // from dropping events.
+    const WAYLAND_TYPE_DELAY: Duration = Duration::from_millis(20);
     const CLIPBOARD_READY_DELAY: Duration = Duration::from_millis(10);
     const CLIPBOARD_PASTE_DELAY: Duration = Duration::from_millis(30);
     const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -153,6 +158,7 @@ mod enabled {
         client: Option<WrtypeClient>,
         attempted: bool,
         partial_seen: bool,
+        partial_typed: bool,
         clipboard: Option<ClipboardSession>,
         clipboard_disabled: bool,
         paste_with_shift: bool,
@@ -168,6 +174,7 @@ mod enabled {
                 client: None,
                 attempted: false,
                 partial_seen: false,
+                partial_typed: false,
                 clipboard: None,
                 clipboard_disabled: false,
                 paste_with_shift,
@@ -191,7 +198,7 @@ mod enabled {
                 }
                 Err(error) => {
                     let _ = output.send(VoiceOutput::Status(format!(
-                        "Wayland virtual keyboard unavailable; falling back to raw keyboard input: {error}"
+                        "Wayland virtual keyboard unavailable; deferring partials until the final transcript: {error}"
                     )));
                     false
                 }
@@ -212,6 +219,7 @@ mod enabled {
         fn begin_turn(&mut self, output: &mpsc::Sender<VoiceOutput>) {
             self.restore_clipboard(output);
             self.partial_seen = false;
+            self.partial_typed = false;
         }
 
         fn type_wayland(
@@ -401,24 +409,61 @@ mod enabled {
             input.begin_turn(&self.output_sender);
         }
 
-        /// Paste a transcript delta immediately. Returns `false` when both
-        /// clipboard paste and the Wayland virtual keyboard are unavailable,
-        /// allowing callers to use the existing uinput keyboard as a fallback.
+        /// Deliver a transcript delta through the ordered virtual keyboard.
+        ///
+        /// If that protocol is unavailable, the delta is deferred and the
+        /// final transcript is entered once through the fallback path.
         pub fn type_partial(&self, text: &str) -> io::Result<bool> {
             let mut input = self.text_input.lock().expect("text input lock poisoned");
+
+            // Never replace the clipboard for every realtime delta.  Clipboard
+            // ownership and the target application's paste request are
+            // asynchronous; when the next delta arrives first, Kitty can read
+            // the wrong source (or no source at all).  The virtual keyboard
+            // protocol gives us ordered key events and wrtype round-trips each
+            // event before continuing.
             input.partial_seen = true;
-            input.type_text(text, &self.output_sender)
+            match input.type_wayland(text, &self.output_sender)? {
+                true => {
+                    input.partial_typed = true;
+                    Ok(true)
+                }
+                false => {
+                    // Do not fall back to one clipboard paste per delta.  Let
+                    // the final, authoritative transcript be pasted once
+                    // instead.  Returning true tells the caller that this
+                    // delta is intentionally deferred rather than asking the
+                    // raw uinput mapper to type it and then duplicating it at
+                    // completion.
+                    Ok(true)
+                }
+            }
         }
 
-        /// Paste a final transcript unless partial deltas have already been
-        /// emitted for this turn. Restore the user's clipboard afterward.
+        /// Complete a transcript turn without duplicating streamed deltas.
+        ///
+        /// When virtual-keyboard delivery was unavailable, partials were
+        /// deferred and this final transcript is delivered once through the
+        /// normal fallback path.  When all partials were typed, the final API
+        /// event is only an acknowledgement and must not be entered again.
         pub fn type_final(&self, text: &str) -> io::Result<bool> {
             let mut input = self.text_input.lock().expect("text input lock poisoned");
             if input.partial_seen {
+                let partial_typed = input.partial_typed;
                 input.partial_seen = false;
-                input.restore_clipboard(&self.output_sender);
-                return Ok(true);
+                input.partial_typed = false;
+                if partial_typed {
+                    input.restore_clipboard(&self.output_sender);
+                    return Ok(true);
+                }
+
+                let typed = input.type_text(text, &self.output_sender)?;
+                if typed {
+                    input.restore_clipboard(&self.output_sender);
+                }
+                return Ok(typed);
             }
+
             let typed = input.type_text(text, &self.output_sender)?;
             if typed {
                 input.restore_clipboard(&self.output_sender);
