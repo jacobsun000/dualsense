@@ -4,8 +4,9 @@
 //! `/sys/class/leds`. Writing `red green blue` values to `multi_intensity`
 //! sends the corresponding light command to the controller.
 
+use anyhow::{Context, Result};
 use std::{
-    fs, io,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -46,27 +47,27 @@ impl ControllerLight {
         rgb_path.exists().then_some(Self { rgb_path })
     }
 
-    pub fn current_rgb(&self) -> io::Result<(u8, u8, u8)> {
-        let value = fs::read_to_string(&self.rgb_path)?;
+    #[cfg(feature = "tui")]
+    pub fn current_rgb(&self) -> Result<(u8, u8, u8)> {
+        let value = fs::read_to_string(&self.rgb_path)
+            .with_context(|| format!("could not read {}", self.rgb_path.display()))?;
         let values: Vec<u8> = value
             .split_whitespace()
             .map(|value| value.parse::<u8>())
-            .collect::<Result<_, _>>()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            .collect::<std::result::Result<_, _>>()
+            .context("invalid RGB LED intensity value")?;
         match values.as_slice() {
             [red, green, blue] => Ok((*red, *green, *blue)),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected RGB LED intensity format",
-            )),
+            _ => Err(anyhow::anyhow!("unexpected RGB LED intensity format")),
         }
     }
 
-    pub fn set_rgb(&self, red: u8, green: u8, blue: u8) -> io::Result<()> {
+    pub fn set_rgb(&self, red: u8, green: u8, blue: u8) -> Result<()> {
         fs::write(&self.rgb_path, format!("{red} {green} {blue}\n"))
+            .with_context(|| format!("could not write {}", self.rgb_path.display()))
     }
 
-    pub fn off(&self) -> io::Result<()> {
+    pub fn off(&self) -> Result<()> {
         self.set_rgb(0, 0, 0)
     }
 }

@@ -5,10 +5,11 @@
 //! own IPC: the event socket tells us when focus changes, and the control
 //! socket supplies the complete `activewindow` record for that change.
 
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::{
     env,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
     sync::{Arc, RwLock},
@@ -41,7 +42,7 @@ impl FocusMonitor {
     /// `Ok(None)` means the current session is unsupported or is not Hyprland.
     /// The monitor is intentionally optional so keyboard mapping continues to
     /// work with the default profile on other desktops.
-    pub fn start() -> io::Result<Option<Self>> {
+    pub fn start() -> Result<Option<Self>> {
         let Some(paths) = HyprlandPaths::from_environment() else {
             return Ok(None);
         };
@@ -53,7 +54,8 @@ impl FocusMonitor {
         let thread_current = Arc::clone(&current);
         thread::Builder::new()
             .name("focused-app".to_owned())
-            .spawn(move || monitor_hyprland(paths, thread_current))?;
+            .spawn(move || monitor_hyprland(paths, thread_current))
+            .context("could not start focused-app monitor")?;
 
         Ok(Some(Self { current }))
     }
@@ -147,7 +149,7 @@ fn refresh_hyprland_focus(paths: &HyprlandPaths, current: &Arc<RwLock<Option<Foc
     }
 }
 
-fn query_active_window(control_socket: &PathBuf) -> io::Result<Option<FocusedApp>> {
+fn query_active_window(control_socket: &PathBuf) -> Result<Option<FocusedApp>> {
     let mut socket = UnixStream::connect(control_socket)?;
     socket.set_read_timeout(Some(Duration::from_secs(1)))?;
     socket.write_all(b"j/activewindow")?;
@@ -158,19 +160,12 @@ fn query_active_window(control_socket: &PathBuf) -> io::Result<Option<FocusedApp
     parse_active_window(&response)
 }
 
-fn parse_active_window(response: &str) -> io::Result<Option<FocusedApp>> {
-    let value: Value = serde_json::from_str(response).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid Hyprland activewindow JSON: {error}"),
-        )
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Hyprland activewindow response is not an object",
-        )
-    })?;
+fn parse_active_window(response: &str) -> Result<Option<FocusedApp>> {
+    let value: Value =
+        serde_json::from_str(response).context("invalid Hyprland activewindow JSON")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("Hyprland activewindow response is not an object"))?;
 
     let address = string_field(object, "address");
     if address.is_empty() || address == "0x0" {

@@ -6,6 +6,7 @@ use crate::keymap::{
 };
 use crate::light::ControllerLight;
 use crate::voice::{VoiceInput, VoiceOutput};
+use anyhow::{Context, Result, anyhow};
 use crossterm::{
     event::{self, Event as TerminalEvent, KeyCode as TerminalKeyCode},
     execute,
@@ -23,9 +24,7 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
-    env,
-    error::Error,
-    fs, io,
+    env, fs, io,
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -327,7 +326,11 @@ impl ControllerState {
                 self.light_rgb = rgb;
                 self.light_status = format!("RGB #{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
             }
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied) =>
+            {
                 self.light_status =
                     "RGB permission denied; install udev/99-dualsense-led.rules".to_owned();
             }
@@ -372,14 +375,15 @@ fn load_calibration() -> Option<JoystickCalibration> {
         .then_some(calibration)
 }
 
-fn save_calibration(calibration: JoystickCalibration) -> io::Result<()> {
-    let path = calibration_path()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+fn save_calibration(calibration: JoystickCalibration) -> Result<()> {
+    let path = calibration_path().ok_or_else(|| anyhow!("HOME is not set"))?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).context("could not create calibration directory")?;
     }
-    let text = serde_json::to_string_pretty(&calibration).map_err(io::Error::other)?;
-    fs::write(path, format!("{text}\n"))
+    let text =
+        serde_json::to_string_pretty(&calibration).context("could not serialize calibration")?;
+    fs::write(path, format!("{text}\n")).context("could not save calibration")?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -548,7 +552,7 @@ fn drain_voice_outputs(
     voice: &VoiceInput,
     mapper: &mut KeyboardMapper,
     sender: &Sender<ReaderMessage>,
-) -> io::Result<()> {
+) -> Result<()> {
     while let Some(message) = voice.try_recv() {
         match message {
             VoiceOutput::Transcript(text) => {
@@ -1201,7 +1205,7 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     receiver: Receiver<ReaderMessage>,
     mut state: ControllerState,
-) -> io::Result<()> {
+) -> Result<()> {
     let mut calibration: Option<CalibrationSession> = None;
     let mut show_mappings = false;
 
@@ -1291,27 +1295,21 @@ fn run_app(
     }
 }
 
-pub fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+pub fn run(path: Option<PathBuf>) -> Result<()> {
     let (path, device) = match path {
         Some(path) => {
-            let device = Device::open(&path)?;
+            let device = Device::open(&path)
+                .with_context(|| format!("could not open {}", path.display()))?;
             if super::is_dualsense(&device) && !super::is_dualsense_gamepad(&device) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "the selected device is a DualSense auxiliary device, not the main gamepad",
-                )
-                .into());
+                return Err(anyhow!(
+                    "the selected device is a DualSense auxiliary device, not the main gamepad"
+                ));
             }
             (path, device)
         }
         None => evdev::enumerate()
             .find(|(_, device)| super::is_dualsense_gamepad(device))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "no DualSense gamepad evdev device found",
-                )
-            })?,
+            .ok_or_else(|| anyhow!("no DualSense gamepad evdev device found"))?,
     };
 
     let (sender, receiver) = mpsc::channel();
@@ -1337,7 +1335,7 @@ pub fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let result = run_app(&mut terminal, receiver, state);
 
     // Always restore the terminal, including when drawing or input polling fails.
-    let cleanup = (|| -> io::Result<()> {
+    let cleanup = (|| -> Result<()> {
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         terminal.show_cursor()?;

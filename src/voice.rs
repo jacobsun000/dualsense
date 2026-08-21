@@ -9,11 +9,12 @@ use crate::input::ControllerEvent;
 #[cfg(feature = "voice")]
 use crate::input::{Button, ButtonState, ControllerEventKind};
 use crate::light::ControllerLight;
-use std::io;
+use anyhow::Result;
 
 #[cfg(feature = "voice")]
 mod enabled {
     use super::*;
+    use anyhow::anyhow;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use futures_util::{SinkExt, StreamExt};
@@ -69,14 +70,14 @@ mod enabled {
     }
 
     impl ClipboardSnapshot {
-        fn capture() -> Result<Self, String> {
+        fn capture() -> Result<Self> {
             let mime_types =
                 match get_mime_types_ordered(PasteClipboardType::Regular, PasteSeat::Unspecified) {
                     Ok(mime_types) => mime_types,
                     Err(PasteError::NoSeats)
                     | Err(PasteError::ClipboardEmpty)
                     | Err(PasteError::NoMimeType) => Vec::new(),
-                    Err(error) => return Err(error.to_string()),
+                    Err(error) => return Err(anyhow!(error)),
                 };
             let mut sources = Vec::with_capacity(mime_types.len());
             for mime_type in mime_types {
@@ -85,10 +86,10 @@ mod enabled {
                     PasteSeat::Unspecified,
                     PasteMimeType::Specific(&mime_type),
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| anyhow!(error))?;
                 let mut data = Vec::new();
                 pipe.read_to_end(&mut data)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| anyhow!(error))?;
                 sources.push(MimeSource {
                     source: Source::Bytes(data.into_boxed_slice()),
                     mime_type: CopyMimeType::Specific(actual_mime_type),
@@ -97,11 +98,11 @@ mod enabled {
             Ok(Self { sources })
         }
 
-        fn restore(self) -> Result<(), String> {
+        fn restore(self) -> Result<()> {
             if self.sources.is_empty() {
-                clear(CopyClipboardType::Regular, CopySeat::All).map_err(|error| error.to_string())
+                clear(CopyClipboardType::Regular, CopySeat::All).map_err(|error| anyhow!(error))
             } else {
-                copy_multi(Options::new(), self.sources).map_err(|error| error.to_string())
+                copy_multi(Options::new(), self.sources).map_err(|error| anyhow!(error))
             }
         }
     }
@@ -111,7 +112,7 @@ mod enabled {
     }
 
     impl ClipboardSession {
-        fn new() -> Result<Self, String> {
+        fn new() -> Result<Self> {
             Ok(Self {
                 snapshot: ClipboardSnapshot::capture()?,
             })
@@ -122,7 +123,7 @@ mod enabled {
             text: &str,
             client: &mut WrtypeClient,
             paste_with_shift: bool,
-        ) -> io::Result<()> {
+        ) -> Result<()> {
             // Keep the data source alive until another copy replaces it. A
             // clipboard manager may request the data before the target app
             // receives the paste shortcut; limiting this to one request can
@@ -134,7 +135,7 @@ mod enabled {
                 Source::Bytes(text.as_bytes().to_vec().into_boxed_slice()),
                 CopyMimeType::Text,
             )
-            .map_err(io::Error::other)?;
+            .map_err(|error| anyhow!(error))?;
             thread::sleep(CLIPBOARD_READY_DELAY);
             let modifiers = if paste_with_shift {
                 [Modifier::Ctrl, Modifier::Shift].as_slice()
@@ -143,13 +144,13 @@ mod enabled {
             };
             client
                 .send_shortcut(modifiers, "v")
-                .map_err(|error| io::Error::other(error.to_string()))?;
+                .map_err(|error| anyhow!(error))?;
             thread::sleep(CLIPBOARD_PASTE_DELAY);
             Ok(())
         }
 
-        fn restore(self) -> io::Result<()> {
-            self.snapshot.restore().map_err(io::Error::other)
+        fn restore(self) -> Result<()> {
+            self.snapshot.restore()
         }
     }
 
@@ -229,11 +230,7 @@ mod enabled {
             self.partial_typed = false;
         }
 
-        fn type_wayland(
-            &mut self,
-            text: &str,
-            output: &mpsc::Sender<VoiceOutput>,
-        ) -> io::Result<bool> {
+        fn type_wayland(&mut self, text: &str, output: &mpsc::Sender<VoiceOutput>) -> Result<bool> {
             if !self.ensure_client(output) {
                 return Ok(false);
             }
@@ -243,14 +240,10 @@ mod enabled {
             client
                 .type_text_with_delay(text, WAYLAND_TYPE_DELAY)
                 .map(|()| true)
-                .map_err(|error| io::Error::other(error.to_string()))
+                .map_err(|error| anyhow!(error))
         }
 
-        fn type_text(
-            &mut self,
-            text: &str,
-            output: &mpsc::Sender<VoiceOutput>,
-        ) -> io::Result<bool> {
+        fn type_text(&mut self, text: &str, output: &mpsc::Sender<VoiceOutput>) -> Result<bool> {
             if !self.clipboard_disabled && self.clipboard.is_none() {
                 match ClipboardSession::new() {
                     Ok(session) => {
@@ -279,8 +272,12 @@ mod enabled {
                     self.restore_clipboard(output);
                 } else {
                     let result = {
-                        let client = self.client.as_mut().expect("Wayland client exists");
-                        let session = self.clipboard.as_ref().expect("clipboard session exists");
+                        let Some(client) = self.client.as_mut() else {
+                            return self.type_wayland(text, output);
+                        };
+                        let Some(session) = self.clipboard.as_ref() else {
+                            return self.type_wayland(text, output);
+                        };
                         session.paste(text, client, self.paste_with_shift)
                     };
                     match result {
@@ -324,7 +321,7 @@ mod enabled {
     }
 
     impl VoiceInput {
-        pub fn new(light: Option<ControllerLight>) -> io::Result<Self> {
+        pub fn new(light: Option<ControllerLight>) -> Result<Self> {
             let (commands, command_receiver) = tokio_mpsc::unbounded_channel();
             let (output_sender, output_receiver) = mpsc::channel();
             let recording = Arc::new(AtomicBool::new(false));
@@ -348,7 +345,7 @@ mod enabled {
                     };
                     runtime.block_on(run_session(command_receiver, worker_output));
                 })
-                .map_err(io::Error::other)?;
+                .map_err(|error| anyhow!(error))?;
 
             let input = Self {
                 commands,
@@ -411,17 +408,29 @@ mod enabled {
         }
 
         pub fn try_recv(&self) -> Option<VoiceOutput> {
-            let receiver = self.outputs.lock().expect("voice output lock poisoned");
-            receiver.try_recv().ok()
+            self.outputs
+                .lock()
+                .ok()
+                .and_then(|receiver| receiver.try_recv().ok())
         }
 
         fn probe_text_input(&self) {
-            let mut input = self.text_input.lock().expect("text input lock poisoned");
+            let Ok(mut input) = self.text_input.lock() else {
+                let _ = self.output_sender.send(VoiceOutput::Status(
+                    "Voice text-input state is unavailable".to_owned(),
+                ));
+                return;
+            };
             let _ = input.ensure_client(&self.output_sender);
         }
 
         fn begin_text_turn(&self) {
-            let mut input = self.text_input.lock().expect("text input lock poisoned");
+            let Ok(mut input) = self.text_input.lock() else {
+                let _ = self.output_sender.send(VoiceOutput::Status(
+                    "Voice text-input state is unavailable".to_owned(),
+                ));
+                return;
+            };
             input.begin_turn(&self.output_sender);
         }
 
@@ -429,8 +438,11 @@ mod enabled {
         ///
         /// If that protocol is unavailable, the delta is deferred and the
         /// final transcript is entered once through the fallback path.
-        pub fn type_partial(&self, text: &str) -> io::Result<bool> {
-            let mut input = self.text_input.lock().expect("text input lock poisoned");
+        pub fn type_partial(&self, text: &str) -> Result<bool> {
+            let mut input = self
+                .text_input
+                .lock()
+                .map_err(|_| anyhow!("voice text-input state is unavailable"))?;
 
             // Never replace the clipboard for every realtime delta.  Clipboard
             // ownership and the target application's paste request are
@@ -462,8 +474,11 @@ mod enabled {
         /// deferred and this final transcript is delivered once through the
         /// normal fallback path.  When all partials were typed, the final API
         /// event is only an acknowledgement and must not be entered again.
-        pub fn type_final(&self, text: &str) -> io::Result<bool> {
-            let mut input = self.text_input.lock().expect("text input lock poisoned");
+        pub fn type_final(&self, text: &str) -> Result<bool> {
+            let mut input = self
+                .text_input
+                .lock()
+                .map_err(|_| anyhow!("voice text-input state is unavailable"))?;
             if input.partial_seen {
                 let partial_typed = input.partial_typed;
                 input.partial_seen = false;
@@ -662,17 +677,17 @@ mod enabled {
         }
     }
 
-    async fn connect_session(api_key: &str) -> Result<Socket, String> {
+    async fn connect_session(api_key: &str) -> Result<Socket> {
         let mut request = "wss://api.openai.com/v1/realtime?intent=transcription"
             .into_client_request()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| anyhow!(error))?;
         let authorization = format!("Bearer {api_key}")
             .parse()
-            .map_err(|error| format!("invalid authorization header: {error}"))?;
+            .map_err(|error| anyhow!("invalid authorization header: {error}"))?;
         request.headers_mut().insert("Authorization", authorization);
         let (mut socket, _) = connect_async(request)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| anyhow!(error))?;
         let session_update = json!({
             "type": "session.update",
             "session": {
@@ -692,7 +707,7 @@ mod enabled {
         socket
             .send(Message::Text(session_update.to_string().into()))
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| anyhow!(error))?;
         Ok(socket)
     }
 
@@ -1222,7 +1237,7 @@ pub enum VoiceOutput {
 
 #[cfg(not(feature = "voice"))]
 impl VoiceInput {
-    pub fn new(_: Option<ControllerLight>) -> io::Result<Self> {
+    pub fn new(_: Option<ControllerLight>) -> Result<Self> {
         Ok(Self)
     }
 
@@ -1234,11 +1249,11 @@ impl VoiceInput {
         None
     }
 
-    pub fn type_partial(&self, _: &str) -> io::Result<bool> {
+    pub fn type_partial(&self, _: &str) -> Result<bool> {
         Ok(false)
     }
 
-    pub fn type_final(&self, _: &str) -> io::Result<bool> {
+    pub fn type_final(&self, _: &str) -> Result<bool> {
         Ok(false)
     }
 }

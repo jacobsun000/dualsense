@@ -4,11 +4,14 @@
 //! evdev is preferable here to talking to the HID report directly: it gives us the same
 //! button and analog-axis events that a future keyboard mapper will consume.
 
-use evdev::{Device, KeyCode};
+use anyhow::{Context, Result};
+use evdev::Device;
+#[cfg(feature = "tui")]
+use evdev::KeyCode;
+use std::env;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::{env, io};
 
 mod focus;
 use focus::FocusMonitor;
@@ -84,6 +87,7 @@ fn print_device_info(path: &str, device: &Device) {
     );
 }
 
+#[cfg(feature = "tui")]
 fn button_event(code: KeyCode) -> bool {
     matches!(
         code,
@@ -118,7 +122,7 @@ fn drain_voice_outputs(
     voice: &VoiceInput,
     mapper: &mut KeyboardMapper,
     output: &Arc<Mutex<()>>,
-) -> io::Result<()> {
+) -> Result<()> {
     while let Some(message) = voice.try_recv() {
         match message {
             VoiceOutput::Transcript(text) => {
@@ -152,33 +156,24 @@ fn read_device(
     mut mapper: KeyboardMapper,
     voice: VoiceInput,
     focus: Option<FocusMonitor>,
-) {
+) -> Result<()> {
     print_device_info(&path, &device);
-    if let Err(error) = device.set_nonblocking(true) {
-        eprintln!("[{path}] could not enable nonblocking input: {error}");
-        return;
-    }
+    device
+        .set_nonblocking(true)
+        .with_context(|| format!("[{path}] could not enable nonblocking input"))?;
     let mut decoder = EventDecoder::new(&device);
 
     loop {
         if let Some(focus) = focus.as_ref() {
             mapper.set_focused_app(focus.current());
         }
-        if let Err(error) = drain_voice_outputs(&path, &voice, &mut mapper, &output) {
-            let _guard = output.lock().expect("output lock poisoned");
-            eprintln!("[{path}] voice input stopped: {error}");
-            return;
-        }
+        drain_voice_outputs(&path, &voice, &mut mapper, &output).context("voice input stopped")?;
         match device.fetch_events() {
             Ok(events) => {
                 for raw_event in events {
                     for event in decoder.decode(raw_event) {
                         voice.handle(event);
-                        if let Err(error) = mapper.handle(event) {
-                            let _guard = output.lock().expect("output lock poisoned");
-                            eprintln!("[{path}] keyboard mapping stopped: {error}");
-                            return;
-                        }
+                        mapper.handle(event).context("keyboard mapping stopped")?;
                         if let ControllerEventKind::Button { button, state } = event.kind {
                             let _guard = output.lock().expect("output lock poisoned");
                             println!("[{path}] button {button:?} {state:?}");
@@ -187,18 +182,10 @@ fn read_device(
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if let Err(error) = mapper.tick() {
-                    let _guard = output.lock().expect("output lock poisoned");
-                    eprintln!("[{path}] mouse mapping stopped: {error}");
-                    return;
-                }
+                mapper.tick().context("mouse mapping stopped")?;
                 thread::sleep(std::time::Duration::from_millis(5));
             }
-            Err(error) => {
-                let _guard = output.lock().expect("output lock poisoned");
-                eprintln!("[{path}] stopped reading controller: {error}");
-                return;
-            }
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -428,6 +415,10 @@ fn main() {
 
     // The workers block in fetch_events(). Ctrl-C terminates the process naturally.
     for worker in workers {
-        let _ = worker.join();
+        match worker.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("Input worker stopped: {error:#}"),
+            Err(_) => eprintln!("Input worker panicked"),
+        }
     }
 }

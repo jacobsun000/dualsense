@@ -7,11 +7,11 @@
 use crate::focus::FocusedApp;
 use crate::input::{Button, ButtonState, ControllerEvent, ControllerEventKind, Stick, StickAxis};
 use crate::keymap::{ControllerInput, DEFAULT_KEYMAP, Direction, KeyAction, KeyStroke, Keymap};
+use anyhow::{Result, bail};
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, EventType, InputEvent, KeyCode, RelativeAxisCode};
 use std::{
     collections::{HashMap, HashSet},
-    io,
     time::Instant,
 };
 
@@ -43,7 +43,7 @@ pub struct KeyboardMapper {
 }
 
 impl KeyboardMapper {
-    pub fn new() -> io::Result<Self> {
+    pub fn new() -> Result<Self> {
         Self::with_keymap(DEFAULT_KEYMAP)
     }
 
@@ -52,7 +52,7 @@ impl KeyboardMapper {
     /// Keeping profile selection outside the event engine makes it possible to
     /// choose an application-specific keymap later without duplicating input
     /// and uinput handling.
-    pub fn with_keymap(keymap: Keymap) -> io::Result<Self> {
+    pub fn with_keymap(keymap: Keymap) -> Result<Self> {
         let keyboard_keys: AttributeSet<KeyCode> = keymap.keyboard_keys.iter().copied().collect();
         let keyboard = VirtualDevice::builder()?
             .name(b"DualSense keyboard mapper")
@@ -87,7 +87,7 @@ impl KeyboardMapper {
         })
     }
 
-    pub fn tick(&mut self) -> io::Result<()> {
+    pub fn tick(&mut self) -> Result<()> {
         self.emit_scroll()
     }
 
@@ -100,7 +100,7 @@ impl KeyboardMapper {
 
     /// Type text through the virtual keyboard. Letter keycodes are translated
     /// for Colemak in the same way as the controller's logical mappings.
-    pub fn type_text(&mut self, text: &str) -> io::Result<()> {
+    pub fn type_text(&mut self, text: &str) -> Result<()> {
         for character in text.chars() {
             let Some((key, shift)) = text_key(character) else {
                 continue;
@@ -115,7 +115,7 @@ impl KeyboardMapper {
         Ok(())
     }
 
-    pub fn handle(&mut self, event: ControllerEvent) -> io::Result<()> {
+    pub fn handle(&mut self, event: ControllerEvent) -> Result<()> {
         match event.kind {
             ControllerEventKind::Button { button, state } => self.handle_button(button, state),
             ControllerEventKind::Stick {
@@ -125,7 +125,7 @@ impl KeyboardMapper {
         }
     }
 
-    fn handle_button(&mut self, button: Button, state: ButtonState) -> io::Result<()> {
+    fn handle_button(&mut self, button: Button, state: ButtonState) -> Result<()> {
         let active = state == ButtonState::Down;
         if self.keymap.is_layer_modifier(button) {
             if active {
@@ -139,7 +139,7 @@ impl KeyboardMapper {
         self.apply_action(ControllerInput::Button(button), active)
     }
 
-    fn handle_stick(&mut self, stick: Stick, axis: StickAxis, value: f32) -> io::Result<()> {
+    fn handle_stick(&mut self, stick: Stick, axis: StickAxis, value: f32) -> Result<()> {
         if stick == Stick::Right {
             match axis {
                 StickAxis::X => self.right_x = value,
@@ -164,7 +164,7 @@ impl KeyboardMapper {
         Ok(())
     }
 
-    fn apply_action(&mut self, input: ControllerInput, active: bool) -> io::Result<()> {
+    fn apply_action(&mut self, input: ControllerInput, active: bool) -> Result<()> {
         let action = self.keymap.action_for(input, &self.active_layers);
         match action {
             Some(KeyAction::Sequence(strokes)) => {
@@ -207,7 +207,7 @@ impl KeyboardMapper {
         source: ControllerInput,
         combo: Option<KeyCombo>,
         active: bool,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         if active {
             if let Some(current) = self.active_sources.get(&source).copied() {
                 if Some(current) == combo {
@@ -229,14 +229,13 @@ impl KeyboardMapper {
         Ok(())
     }
 
-    fn release_source(&mut self, source: ControllerInput) -> io::Result<()> {
+    fn release_source(&mut self, source: ControllerInput) -> Result<()> {
         let Some(combo) = self.active_sources.remove(&source) else {
             return Ok(());
         };
-        let count = self
-            .active_combos
-            .get_mut(&combo)
-            .expect("active source must have an active combo");
+        let Some(count) = self.active_combos.get_mut(&combo) else {
+            bail!("active source has no active key combination");
+        };
         *count -= 1;
         if *count == 0 {
             self.active_combos.remove(&combo);
@@ -245,7 +244,7 @@ impl KeyboardMapper {
         Ok(())
     }
 
-    fn emit_sequence(&mut self, strokes: &[KeyStroke]) -> io::Result<()> {
+    fn emit_sequence(&mut self, strokes: &[KeyStroke]) -> Result<()> {
         for &stroke in strokes {
             let combo = physical_combo(stroke);
             self.emit_combo(combo, true)?;
@@ -254,7 +253,7 @@ impl KeyboardMapper {
         Ok(())
     }
 
-    fn emit_combo(&mut self, combo: KeyCombo, down: bool) -> io::Result<()> {
+    fn emit_combo(&mut self, combo: KeyCombo, down: bool) -> Result<()> {
         let mut events = Vec::with_capacity(combo.modifiers.len() + 1);
         if down {
             for &modifier in combo.modifiers {
@@ -267,10 +266,11 @@ impl KeyboardMapper {
                 events.push(key_event(modifier, false));
             }
         }
-        self.keyboard.emit(&events)
+        self.keyboard.emit(&events)?;
+        Ok(())
     }
 
-    fn emit_scroll(&mut self) -> io::Result<()> {
+    fn emit_scroll(&mut self) -> Result<()> {
         let now = Instant::now();
         let delta = now.duration_since(self.last_scroll).as_secs_f32().min(0.1);
         self.last_scroll = now;
@@ -309,7 +309,8 @@ impl KeyboardMapper {
                 -vertical,
             ));
         }
-        self.mouse.emit(&events)
+        self.mouse.emit(&events)?;
+        Ok(())
     }
 }
 
