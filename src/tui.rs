@@ -1,5 +1,8 @@
-use crate::input::{ControllerEvent, EventDecoder};
+use crate::input::{Button, ControllerEvent, EventDecoder};
 use crate::keyboard::KeyboardMapper;
+use crate::keymap::{
+    ControllerInput, DEFAULT_KEYMAP, Direction as MappingDirection, Keymap, action_label,
+};
 use crate::light::ControllerLight;
 use crate::voice::{VoiceInput, VoiceOutput};
 use crossterm::{
@@ -820,7 +823,28 @@ fn render_microphone(frame: &mut Frame<'_>, area: Rect, state: &ControllerState)
     );
 }
 
-fn render_mapping_overlay(frame: &mut Frame<'_>) {
+fn mapping_line(
+    keymap: &Keymap,
+    label: &str,
+    input: ControllerInput,
+    active_layers: &HashSet<Button>,
+) -> Line<'static> {
+    Line::from(format!(
+        "{label}  {}",
+        action_label(keymap.action_for(input, active_layers))
+    ))
+}
+
+fn stick_action_label(
+    keymap: &Keymap,
+    stick: crate::input::Stick,
+    direction: MappingDirection,
+    active_layers: &HashSet<Button>,
+) -> String {
+    action_label(keymap.action_for(ControllerInput::Stick { stick, direction }, active_layers))
+}
+
+fn render_mapping_overlay(frame: &mut Frame<'_>, keymap: &Keymap) {
     let screen = frame.area();
     let popup = Rect {
         x: screen.x.saturating_add(2),
@@ -835,35 +859,103 @@ fn render_mapping_overlay(frame: &mut Frame<'_>) {
     frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
+    let base = HashSet::new();
+    let l1 = HashSet::from([Button::L1]);
+    let r1 = HashSet::from([Button::R1]);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(inner);
     let left = vec![
         Line::from(Span::styled("BASE", active_style())),
-        Line::from("△  Ctrl+U"),
-        Line::from("×  Ctrl+E"),
-        Line::from("□  no mapping"),
-        Line::from("○  no mapping"),
-        Line::from("D-pad ↑  Alt+↑"),
-        Line::from("D-pad ↓  Alt+↓"),
-        Line::from("D-pad ←  Alt+←"),
-        Line::from("D-pad →  Alt+→"),
+        mapping_line(keymap, "△", ControllerInput::Button(Button::North), &base),
+        mapping_line(keymap, "×", ControllerInput::Button(Button::South), &base),
+        mapping_line(keymap, "□", ControllerInput::Button(Button::West), &base),
+        mapping_line(keymap, "○", ControllerInput::Button(Button::East), &base),
+        mapping_line(
+            keymap,
+            "D-pad ↑",
+            ControllerInput::Button(Button::DpadUp),
+            &base,
+        ),
+        mapping_line(
+            keymap,
+            "D-pad ↓",
+            ControllerInput::Button(Button::DpadDown),
+            &base,
+        ),
+        mapping_line(
+            keymap,
+            "D-pad ←",
+            ControllerInput::Button(Button::DpadLeft),
+            &base,
+        ),
+        mapping_line(
+            keymap,
+            "D-pad →",
+            ControllerInput::Button(Button::DpadRight),
+            &base,
+        ),
         Line::from("L1 / R1  layer modifiers"),
         Line::from("L2 / R2  no mapping"),
     ];
+    let left_stick = crate::input::Stick::Left;
     let right = vec![
         Line::from(Span::styled("LAYERS", active_style())),
-        Line::from("L1 + □  N    L1 + ○  I"),
-        Line::from("L1 + △  U    L1 + ×  E"),
-        Line::from("R1 + ↑  P I Enter (sequence)"),
-        Line::from("R1 + ↓  Ctrl+W"),
-        Line::from("R1 + ←  Alt+G"),
-        Line::from("R1 + →  Ctrl+T"),
+        mapping_line(keymap, "L1 + □", ControllerInput::Button(Button::West), &l1),
+        mapping_line(keymap, "L1 + ○", ControllerInput::Button(Button::East), &l1),
+        mapping_line(
+            keymap,
+            "L1 + △",
+            ControllerInput::Button(Button::North),
+            &l1,
+        ),
+        mapping_line(
+            keymap,
+            "L1 + ×",
+            ControllerInput::Button(Button::South),
+            &l1,
+        ),
+        mapping_line(
+            keymap,
+            "R1 + ↑",
+            ControllerInput::Button(Button::DpadUp),
+            &r1,
+        ),
+        mapping_line(
+            keymap,
+            "R1 + ↓",
+            ControllerInput::Button(Button::DpadDown),
+            &r1,
+        ),
+        mapping_line(
+            keymap,
+            "R1 + ←",
+            ControllerInput::Button(Button::DpadLeft),
+            &r1,
+        ),
+        mapping_line(
+            keymap,
+            "R1 + →",
+            ControllerInput::Button(Button::DpadRight),
+            &r1,
+        ),
         Line::from("Hold ○  voice input (green); release types text"),
         Line::from(Span::styled("STICKS", active_style())),
-        Line::from("Left stick  Meta+N/I/U/E"),
-        Line::from("R1 + left stick  Meta+←/→/U/E"),
+        Line::from(format!(
+            "Left stick ←/→/↑/↓  {}/{}/{}/{}",
+            stick_action_label(keymap, left_stick, MappingDirection::Left, &base),
+            stick_action_label(keymap, left_stick, MappingDirection::Right, &base),
+            stick_action_label(keymap, left_stick, MappingDirection::Up, &base),
+            stick_action_label(keymap, left_stick, MappingDirection::Down, &base),
+        )),
+        Line::from(format!(
+            "R1 + left stick ←/→/↑/↓  {}/{}/{}/{}",
+            stick_action_label(keymap, left_stick, MappingDirection::Left, &r1),
+            stick_action_label(keymap, left_stick, MappingDirection::Right, &r1),
+            stick_action_label(keymap, left_stick, MappingDirection::Up, &r1),
+            stick_action_label(keymap, left_stick, MappingDirection::Down, &r1),
+        )),
         Line::from("Right stick  mouse scroll"),
         Line::from("L3 / R3, triggers, Create/PS/Options: none"),
         Line::from("Targets use logical QWERTY; Colemak compensation applies."),
@@ -998,6 +1090,7 @@ fn draw(
     state: &ControllerState,
     calibration: Option<&CalibrationSession>,
     show_mappings: bool,
+    keymap: &Keymap,
 ) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -1095,7 +1188,7 @@ fn draw(
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, outer[3]);
     if show_mappings {
-        render_mapping_overlay(frame);
+        render_mapping_overlay(frame, keymap);
     }
 }
 
@@ -1136,7 +1229,15 @@ fn run_app(
         if let Some(session) = calibration.as_mut() {
             session.sample(&state);
         }
-        terminal.draw(|frame| draw(frame, &state, calibration.as_ref(), show_mappings))?;
+        terminal.draw(|frame| {
+            draw(
+                frame,
+                &state,
+                calibration.as_ref(),
+                show_mappings,
+                &DEFAULT_KEYMAP,
+            )
+        })?;
 
         if event::poll(Duration::from_millis(50))?
             && let TerminalEvent::Key(key) = event::read()?

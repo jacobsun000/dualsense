@@ -12,6 +12,7 @@ use std::{env, io};
 
 mod input;
 use input::{ControllerEventKind, EventDecoder};
+mod keymap;
 mod light;
 use light::{ControllerLight, parse_color};
 mod keyboard;

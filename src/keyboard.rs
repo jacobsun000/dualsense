@@ -5,6 +5,7 @@
 //! mapping is active in both direct and TUI modes.
 
 use crate::input::{Button, ButtonState, ControllerEvent, ControllerEventKind, Stick, StickAxis};
+use crate::keymap::{ControllerInput, DEFAULT_KEYMAP, Direction, KeyAction, KeyStroke, Keymap};
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, EventType, InputEvent, KeyCode, RelativeAxisCode};
 use std::{
@@ -13,39 +14,25 @@ use std::{
     time::Instant,
 };
 
-const STICK_DEADZONE: f32 = 0.35;
-const MAX_SCROLL_PER_SECOND: f32 = 24.0;
+const NO_MODIFIERS: &[KeyCode] = &[];
+const SHIFT: &[KeyCode] = &[KeyCode::KEY_LEFTSHIFT];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct KeyCombo {
-    modifier: Option<KeyCode>,
+    modifiers: &'static [KeyCode],
     key: KeyCode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Source {
-    Button(Button),
-    Stick { stick: Stick, direction: Direction },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Direction {
-    Left,
-    Right,
-    Up,
-    Down,
 }
 
 pub struct KeyboardMapper {
     keyboard: VirtualDevice,
     mouse: VirtualDevice,
-    l1_down: bool,
-    r1_down: bool,
+    keymap: Keymap,
+    active_layers: HashSet<Button>,
     left_x: f32,
     left_y: f32,
-    active_sources: HashMap<Source, KeyCombo>,
+    active_sources: HashMap<ControllerInput, KeyCombo>,
     active_combos: HashMap<KeyCombo, usize>,
-    sequence_sources: HashSet<Source>,
+    sequence_sources: HashSet<ControllerInput>,
     right_x: f32,
     right_y: f32,
     scroll_x_remainder: f32,
@@ -55,80 +42,16 @@ pub struct KeyboardMapper {
 
 impl KeyboardMapper {
     pub fn new() -> io::Result<Self> {
-        let keyboard_keys: AttributeSet<KeyCode> = [
-            // The mapper's logical targets are written in QWERTY terms.
-            // These are the physical keycodes that produce them under Colemak.
-            KeyCode::KEY_F,
-            KeyCode::KEY_I,
-            KeyCode::KEY_J,
-            KeyCode::KEY_K,
-            KeyCode::KEY_L,
-            KeyCode::KEY_R,
-            KeyCode::KEY_T,
-            KeyCode::KEY_W,
-            KeyCode::KEY_X,
-            KeyCode::KEY_ENTER,
-            KeyCode::KEY_P,
-            KeyCode::KEY_SLASH,
-            KeyCode::KEY_LEFT,
-            KeyCode::KEY_RIGHT,
-            KeyCode::KEY_UP,
-            KeyCode::KEY_DOWN,
-            KeyCode::KEY_LEFTCTRL,
-            KeyCode::KEY_LEFTALT,
-            KeyCode::KEY_LEFTMETA,
-            KeyCode::KEY_LEFTSHIFT,
-            KeyCode::KEY_SPACE,
-            KeyCode::KEY_TAB,
-            KeyCode::KEY_A,
-            KeyCode::KEY_B,
-            KeyCode::KEY_C,
-            KeyCode::KEY_D,
-            KeyCode::KEY_E,
-            KeyCode::KEY_F,
-            KeyCode::KEY_G,
-            KeyCode::KEY_H,
-            KeyCode::KEY_I,
-            KeyCode::KEY_J,
-            KeyCode::KEY_K,
-            KeyCode::KEY_L,
-            KeyCode::KEY_M,
-            KeyCode::KEY_N,
-            KeyCode::KEY_O,
-            KeyCode::KEY_P,
-            KeyCode::KEY_Q,
-            KeyCode::KEY_R,
-            KeyCode::KEY_S,
-            KeyCode::KEY_T,
-            KeyCode::KEY_U,
-            KeyCode::KEY_V,
-            KeyCode::KEY_W,
-            KeyCode::KEY_X,
-            KeyCode::KEY_Y,
-            KeyCode::KEY_Z,
-            KeyCode::KEY_0,
-            KeyCode::KEY_1,
-            KeyCode::KEY_2,
-            KeyCode::KEY_3,
-            KeyCode::KEY_4,
-            KeyCode::KEY_5,
-            KeyCode::KEY_6,
-            KeyCode::KEY_7,
-            KeyCode::KEY_8,
-            KeyCode::KEY_9,
-            KeyCode::KEY_MINUS,
-            KeyCode::KEY_EQUAL,
-            KeyCode::KEY_LEFTBRACE,
-            KeyCode::KEY_RIGHTBRACE,
-            KeyCode::KEY_BACKSLASH,
-            KeyCode::KEY_SEMICOLON,
-            KeyCode::KEY_APOSTROPHE,
-            KeyCode::KEY_GRAVE,
-            KeyCode::KEY_COMMA,
-            KeyCode::KEY_DOT,
-        ]
-        .into_iter()
-        .collect();
+        Self::with_keymap(DEFAULT_KEYMAP)
+    }
+
+    /// Create a mapper with a specific profile.
+    ///
+    /// Keeping profile selection outside the event engine makes it possible to
+    /// choose an application-specific keymap later without duplicating input
+    /// and uinput handling.
+    pub fn with_keymap(keymap: Keymap) -> io::Result<Self> {
+        let keyboard_keys: AttributeSet<KeyCode> = keymap.keyboard_keys.iter().copied().collect();
         let keyboard = VirtualDevice::builder()?
             .name(b"DualSense keyboard mapper")
             .with_keys(&keyboard_keys)?
@@ -146,8 +69,8 @@ impl KeyboardMapper {
         Ok(Self {
             keyboard,
             mouse,
-            l1_down: false,
-            r1_down: false,
+            keymap,
+            active_layers: HashSet::new(),
             left_x: 0.0,
             left_y: 0.0,
             active_sources: HashMap::new(),
@@ -172,10 +95,10 @@ impl KeyboardMapper {
             let Some((key, shift)) = text_key(character) else {
                 continue;
             };
-            let combo = KeyCombo {
-                modifier: shift.then_some(KeyCode::KEY_LEFTSHIFT),
-                key: colemak_physical_key(key),
-            };
+            let combo = physical_combo(KeyStroke::with_modifiers(
+                if shift { SHIFT } else { NO_MODIFIERS },
+                key,
+            ));
             self.emit_combo(combo, true)?;
             self.emit_combo(combo, false)?;
         }
@@ -193,34 +116,17 @@ impl KeyboardMapper {
     }
 
     fn handle_button(&mut self, button: Button, state: ButtonState) -> io::Result<()> {
-        let source = Source::Button(button);
-        if button == Button::DpadUp {
-            if state == ButtonState::Down && self.r1_down {
-                if self.sequence_sources.insert(source) {
-                    self.emit_sequence(&[KeyCode::KEY_P, KeyCode::KEY_I, KeyCode::KEY_ENTER])?;
-                }
-                return Ok(());
+        let active = state == ButtonState::Down;
+        if self.keymap.is_layer_modifier(button) {
+            if active {
+                self.active_layers.insert(button);
+            } else {
+                self.active_layers.remove(&button);
             }
-            if state == ButtonState::Up && self.sequence_sources.remove(&source) {
-                return Ok(());
-            }
+            return Ok(());
         }
 
-        match button {
-            Button::L1 => {
-                self.l1_down = state == ButtonState::Down;
-                return Ok(());
-            }
-            Button::R1 => {
-                self.r1_down = state == ButtonState::Down;
-                return Ok(());
-            }
-            _ => {}
-        }
-
-        let source = Source::Button(button);
-        let combo = self.button_combo(button);
-        self.set_source(source, combo, state == ButtonState::Down)
+        self.apply_action(ControllerInput::Button(button), active)
     }
 
     fn handle_stick(&mut self, stick: Stick, axis: StickAxis, value: f32) -> io::Result<()> {
@@ -238,130 +144,100 @@ impl KeyboardMapper {
             StickAxis::Y => self.left_y = value,
         }
         for (direction, active) in [
-            (Direction::Left, self.left_x < -STICK_DEADZONE),
-            (Direction::Right, self.left_x > STICK_DEADZONE),
-            (Direction::Up, self.left_y < -STICK_DEADZONE),
-            (Direction::Down, self.left_y > STICK_DEADZONE),
+            (Direction::Left, self.left_x < -self.keymap.stick_deadzone),
+            (Direction::Right, self.left_x > self.keymap.stick_deadzone),
+            (Direction::Up, self.left_y < -self.keymap.stick_deadzone),
+            (Direction::Down, self.left_y > self.keymap.stick_deadzone),
         ] {
-            let source = Source::Stick { stick, direction };
-            let combo = self.stick_combo(direction);
-            self.set_source(source, combo, active)?;
+            self.apply_action(ControllerInput::Stick { stick, direction }, active)?;
         }
         Ok(())
     }
 
-    fn button_combo(&self, button: Button) -> Option<KeyCombo> {
-        let (direction, combo) = match button {
-            // Right-side face buttons, arranged as a D-pad:
-            //     North
-            // West       East
-            //     South
-            Button::North => (
-                Direction::Up,
-                Some(key_combo(Some(KeyCode::KEY_LEFTCTRL), KeyCode::KEY_U)),
-            ),
-            Button::South => (
-                Direction::Down,
-                Some(key_combo(Some(KeyCode::KEY_LEFTCTRL), KeyCode::KEY_E)),
-            ),
-            Button::West => (Direction::Left, None),
-            Button::East => (Direction::Right, None),
-            Button::DpadUp => (
-                Direction::Up,
-                Some(key_combo(Some(KeyCode::KEY_LEFTALT), KeyCode::KEY_UP)),
-            ),
-            Button::DpadDown => (
-                Direction::Down,
-                Some(key_combo(Some(KeyCode::KEY_LEFTALT), KeyCode::KEY_DOWN)),
-            ),
-            Button::DpadLeft => (
-                Direction::Left,
-                Some(key_combo(Some(KeyCode::KEY_LEFTALT), KeyCode::KEY_LEFT)),
-            ),
-            Button::DpadRight => (
-                Direction::Right,
-                Some(key_combo(Some(KeyCode::KEY_LEFTALT), KeyCode::KEY_RIGHT)),
-            ),
-            _ => return None,
-        };
-
-        if matches!(
-            button,
-            Button::North | Button::South | Button::West | Button::East
-        ) && self.l1_down
-        {
-            return Some(match direction {
-                Direction::Left => key_combo(None, KeyCode::KEY_N),
-                Direction::Right => key_combo(None, KeyCode::KEY_I),
-                Direction::Up => key_combo(None, KeyCode::KEY_U),
-                Direction::Down => key_combo(None, KeyCode::KEY_E),
-            });
+    fn apply_action(&mut self, input: ControllerInput, active: bool) -> io::Result<()> {
+        let action = self.keymap.action_for(input, &self.active_layers);
+        match action {
+            Some(KeyAction::Sequence(strokes)) => {
+                // A layer can change while a control is held. Release any old
+                // held stroke before treating a new press as a sequence.
+                if active {
+                    self.set_source(input, None, false)?;
+                    if self.sequence_sources.insert(input) {
+                        self.emit_sequence(strokes)?;
+                    }
+                } else {
+                    self.sequence_sources.remove(&input);
+                    self.set_source(input, None, false)?;
+                }
+            }
+            Some(action) => {
+                self.sequence_sources.remove(&input);
+                self.set_source(input, self.combo_for(action), active)?;
+            }
+            None => {
+                self.sequence_sources.remove(&input);
+                self.set_source(input, None, active)?;
+            }
         }
-
-        if matches!(
-            button,
-            Button::DpadLeft | Button::DpadRight | Button::DpadDown
-        ) && self.r1_down
-        {
-            return Some(match direction {
-                Direction::Left => key_combo(Some(KeyCode::KEY_LEFTALT), KeyCode::KEY_G),
-                Direction::Right => key_combo(Some(KeyCode::KEY_LEFTCTRL), KeyCode::KEY_T),
-                Direction::Down => key_combo(Some(KeyCode::KEY_LEFTCTRL), KeyCode::KEY_W),
-                Direction::Up => combo.expect("D-pad up has a default mapping"),
-            });
-        }
-        combo
+        Ok(())
     }
 
-    fn stick_combo(&self, direction: Direction) -> Option<KeyCombo> {
-        match direction {
-            Direction::Left if self.r1_down => {
-                Some(key_combo(Some(KeyCode::KEY_LEFTMETA), KeyCode::KEY_LEFT))
-            }
-            Direction::Right if self.r1_down => {
-                Some(key_combo(Some(KeyCode::KEY_LEFTMETA), KeyCode::KEY_RIGHT))
-            }
-            Direction::Left => Some(key_combo(Some(KeyCode::KEY_LEFTMETA), KeyCode::KEY_N)),
-            Direction::Right => Some(key_combo(Some(KeyCode::KEY_LEFTMETA), KeyCode::KEY_I)),
-            Direction::Up => Some(key_combo(Some(KeyCode::KEY_LEFTMETA), KeyCode::KEY_U)),
-            Direction::Down => Some(key_combo(Some(KeyCode::KEY_LEFTMETA), KeyCode::KEY_E)),
-        }
+    fn combo_for(&self, action: KeyAction) -> Option<KeyCombo> {
+        let KeyAction::Stroke(stroke) = action else {
+            return None;
+        };
+        Some(KeyCombo {
+            modifiers: stroke.modifiers,
+            key: colemak_physical_key(stroke.key),
+        })
     }
 
     fn set_source(
         &mut self,
-        source: Source,
+        source: ControllerInput,
         combo: Option<KeyCombo>,
         active: bool,
     ) -> io::Result<()> {
         if active {
-            let Some(combo) = combo else { return Ok(()) };
-            if self.active_sources.contains_key(&source) {
-                return Ok(());
+            if let Some(current) = self.active_sources.get(&source).copied() {
+                if Some(current) == combo {
+                    return Ok(());
+                }
+                self.release_source(source)?;
             }
+
+            let Some(combo) = combo else { return Ok(()) };
             let first_source = self.active_combos.get(&combo).copied().unwrap_or(0) == 0;
             if first_source {
                 self.emit_combo(combo, true)?;
             }
             *self.active_combos.entry(combo).or_insert(0) += 1;
             self.active_sources.insert(source, combo);
-        } else if let Some(combo) = self.active_sources.remove(&source) {
-            let count = self
-                .active_combos
-                .get_mut(&combo)
-                .expect("active source must have an active combo");
-            *count -= 1;
-            if *count == 0 {
-                self.active_combos.remove(&combo);
-                self.emit_combo(combo, false)?;
-            }
+        } else {
+            self.release_source(source)?;
         }
         Ok(())
     }
 
-    fn emit_sequence(&mut self, keys: &[KeyCode]) -> io::Result<()> {
-        for &key in keys {
-            let combo = key_combo(None, key);
+    fn release_source(&mut self, source: ControllerInput) -> io::Result<()> {
+        let Some(combo) = self.active_sources.remove(&source) else {
+            return Ok(());
+        };
+        let count = self
+            .active_combos
+            .get_mut(&combo)
+            .expect("active source must have an active combo");
+        *count -= 1;
+        if *count == 0 {
+            self.active_combos.remove(&combo);
+            self.emit_combo(combo, false)?;
+        }
+        Ok(())
+    }
+
+    fn emit_sequence(&mut self, strokes: &[KeyStroke]) -> io::Result<()> {
+        for &stroke in strokes {
+            let combo = physical_combo(stroke);
             self.emit_combo(combo, true)?;
             self.emit_combo(combo, false)?;
         }
@@ -369,15 +245,15 @@ impl KeyboardMapper {
     }
 
     fn emit_combo(&mut self, combo: KeyCombo, down: bool) -> io::Result<()> {
-        let mut events = Vec::with_capacity(2);
+        let mut events = Vec::with_capacity(combo.modifiers.len() + 1);
         if down {
-            if let Some(modifier) = combo.modifier {
+            for &modifier in combo.modifiers {
                 events.push(key_event(modifier, true));
             }
             events.push(key_event(combo.key, true));
         } else {
             events.push(key_event(combo.key, false));
-            if let Some(modifier) = combo.modifier {
+            for &modifier in combo.modifiers.iter().rev() {
                 events.push(key_event(modifier, false));
             }
         }
@@ -388,8 +264,16 @@ impl KeyboardMapper {
         let now = Instant::now();
         let delta = now.duration_since(self.last_scroll).as_secs_f32().min(0.1);
         self.last_scroll = now;
-        self.scroll_x_remainder += scroll_speed(self.right_x) * delta;
-        self.scroll_y_remainder += scroll_speed(self.right_y) * delta;
+        self.scroll_x_remainder += scroll_speed(
+            self.right_x,
+            self.keymap.stick_deadzone,
+            self.keymap.max_scroll_per_second,
+        ) * delta;
+        self.scroll_y_remainder += scroll_speed(
+            self.right_y,
+            self.keymap.stick_deadzone,
+            self.keymap.max_scroll_per_second,
+        ) * delta;
 
         let horizontal = self.scroll_x_remainder.trunc() as i32;
         let vertical = self.scroll_y_remainder.trunc() as i32;
@@ -430,10 +314,10 @@ impl Drop for KeyboardMapper {
     }
 }
 
-fn key_combo(modifier: Option<KeyCode>, key: KeyCode) -> KeyCombo {
+fn physical_combo(stroke: KeyStroke) -> KeyCombo {
     KeyCombo {
-        modifier,
-        key: colemak_physical_key(key),
+        modifiers: stroke.modifiers,
+        key: colemak_physical_key(stroke.key),
     }
 }
 
@@ -547,13 +431,13 @@ fn text_key(character: char) -> Option<(KeyCode, bool)> {
     Some((key, shift || punctuation_shift))
 }
 
-fn scroll_speed(value: f32) -> f32 {
+fn scroll_speed(value: f32, deadzone: f32, max_scroll_per_second: f32) -> f32 {
     let magnitude = value.abs();
-    if magnitude <= STICK_DEADZONE {
+    if magnitude <= deadzone {
         return 0.0;
     }
-    let normalized = ((magnitude - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)).clamp(0.0, 1.0);
-    value.signum() * normalized.powi(2) * MAX_SCROLL_PER_SECOND
+    let normalized = ((magnitude - deadzone) / (1.0 - deadzone)).clamp(0.0, 1.0);
+    value.signum() * normalized.powi(2) * max_scroll_per_second
 }
 
 #[cfg(test)]
