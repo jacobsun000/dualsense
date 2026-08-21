@@ -1,3 +1,4 @@
+use crate::dualsense;
 use crate::focus::FocusMonitor;
 use crate::input::{Button, ControllerEvent, EventDecoder};
 use crate::keyboard::KeyboardMapper;
@@ -276,7 +277,7 @@ impl ControllerState {
         match event.event_type() {
             EventType::KEY => {
                 let code = KeyCode::new(event.code());
-                if super::button_event(code) {
+                if dualsense::button_event(code) {
                     if event.value() == 0 {
                         self.buttons.remove(&code);
                     } else {
@@ -1298,17 +1299,11 @@ fn run_app(
 pub fn run(path: Option<PathBuf>) -> Result<()> {
     let (path, device) = match path {
         Some(path) => {
-            let device = Device::open(&path)
-                .with_context(|| format!("could not open {}", path.display()))?;
-            if super::is_dualsense(&device) && !super::is_dualsense_gamepad(&device) {
-                return Err(anyhow!(
-                    "the selected device is a DualSense auxiliary device, not the main gamepad"
-                ));
-            }
-            (path, device)
+            let controller = dualsense::open_controller(&path)?;
+            (controller.path, controller.device)
         }
-        None => evdev::enumerate()
-            .find(|(_, device)| super::is_dualsense_gamepad(device))
+        None => dualsense::discover_controller()
+            .map(|controller| (controller.path, controller.device))
             .ok_or_else(|| anyhow!("no DualSense gamepad evdev device found"))?,
     };
 

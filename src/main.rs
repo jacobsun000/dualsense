@@ -1,120 +1,51 @@
-//! Print the Linux input events produced by a DualSense controller.
-//!
-//! The kernel's `hid-playstation` driver exposes the controller through evdev.  Reading
-//! evdev is preferable here to talking to the HID report directly: it gives us the same
-//! button and analog-axis events that a future keyboard mapper will consume.
+//! Read and map the Linux input events produced by a DualSense controller.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use clap::Parser;
 use evdev::Device;
-#[cfg(feature = "tui")]
-use evdev::KeyCode;
-use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+mod dualsense;
 mod focus;
 use focus::FocusMonitor;
 mod input;
 use input::{ControllerEventKind, EventDecoder};
+mod keyboard;
 mod keymap;
+use keyboard::KeyboardMapper;
 mod light;
 use light::{ControllerLight, parse_color};
-mod keyboard;
-use keyboard::KeyboardMapper;
 mod voice;
 use voice::{VoiceInput, VoiceOutput};
 
 #[cfg(feature = "tui")]
 mod tui;
 
-const SONY_VENDOR_ID: u16 = 0x054c;
-const DUALSENSE_USB_PRODUCT_ID: u16 = 0x0ce6;
-const DUALSENSE_BLUETOOTH_PRODUCT_ID: u16 = 0x0df2;
+#[derive(Debug, Parser)]
+#[command(
+    name = "dualsense",
+    version,
+    about = "Read and map DualSense controller input",
+    long_about = "Read and map DualSense controller input.\n\nWith no argument, listen to the automatically discovered gamepad evdev device.\nPass an event device path to listen to that device explicitly.\nUse --light to change the controller RGB indicator.\nHold the right face button (○) to dictate through OPENAI_API_KEY.\nUse --tui for an interactive status screen when the tui feature is enabled."
+)]
+struct Cli {
+    /// Print all readable evdev devices and their DualSense classification.
+    #[arg(long, conflicts_with_all = ["light", "tui", "device"])]
+    list: bool,
 
-fn usage() {
-    println!(
-        "Usage: dualsense [--list | --light <RRGGBB|off> | /dev/input/eventN]\n\n\
-         With no argument, listen to the main gamepad evdev device.\n\
-         Pass an event device path to listen to that device explicitly.\n\
-         Use --light to change the controller RGB indicator; optionally pass\n\
-         an event device path after the color.\n\
-         Hold the right face button (○) to dictate through OPENAI_API_KEY;\n\
-         partial transcript text is entered as it arrives through the Wayland\n\
-         virtual keyboard.\n\
-         Environment variables can also be placed in .env; shell values take precedence.\n\
-         Use --tui (with the tui feature) for an interactive status screen.\n\n\
-         Examples:\n\
-           dualsense\n\
-           dualsense --list\n\
-           dualsense --light '#ff6600'\n\
-           dualsense --light off /dev/input/event24\n\
-           dualsense /dev/input/event17\n\
-           cargo run --features tui -- --tui"
-    );
-}
+    /// Set the controller light using RRGGBB, #RRGGBB, or off.
+    #[arg(long, value_name = "COLOR", conflicts_with = "tui")]
+    light: Option<String>,
 
-fn is_dualsense(device: &Device) -> bool {
-    let name = device.name().unwrap_or_default().to_ascii_lowercase();
-    let id = device.input_id();
+    /// Run the interactive terminal UI.
+    #[arg(long, conflicts_with = "light")]
+    tui: bool,
 
-    // Do not identify devices by name alone: our virtual mapper devices are
-    // intentionally named "DualSense keyboard/mouse mapper" too. The Sony
-    // vendor ID is the important part of the identity check.
-    id.vendor() == SONY_VENDOR_ID
-        && (matches!(
-            id.product(),
-            DUALSENSE_USB_PRODUCT_ID | DUALSENSE_BLUETOOTH_PRODUCT_ID
-        ) || name.contains("dualsense"))
-}
-
-fn is_dualsense_gamepad(device: &Device) -> bool {
-    if !is_dualsense(device) {
-        return false;
-    }
-
-    // hid-playstation exposes separate evdev devices for the touchpad, motion
-    // sensors, and headset jack. Their ABS axes are not joystick/trigger axes.
-    let name = device.name().unwrap_or_default().to_ascii_lowercase();
-    !name.contains("touchpad") && !name.contains("motion sensor") && !name.contains("headset jack")
-}
-
-fn print_device_info(path: &str, device: &Device) {
-    println!(
-        "Listening to {path}: name={:?}, id={:?}",
-        device.name(),
-        device.input_id()
-    );
-}
-
-#[cfg(feature = "tui")]
-fn button_event(code: KeyCode) -> bool {
-    matches!(
-        code,
-        KeyCode::BTN_SOUTH
-            | KeyCode::BTN_EAST
-            | KeyCode::BTN_NORTH
-            | KeyCode::BTN_WEST
-            | KeyCode::BTN_TL
-            | KeyCode::BTN_TR
-            | KeyCode::BTN_TL2
-            | KeyCode::BTN_TR2
-            | KeyCode::BTN_SELECT
-            | KeyCode::BTN_START
-            | KeyCode::BTN_MODE
-            | KeyCode::BTN_THUMBL
-            | KeyCode::BTN_THUMBR
-            | KeyCode::BTN_DPAD_UP
-            | KeyCode::BTN_DPAD_DOWN
-            | KeyCode::BTN_DPAD_LEFT
-            | KeyCode::BTN_DPAD_RIGHT
-            // hid-playstation reports the DualSense D-pad as the standard
-            // keyboard direction key codes on some kernel versions.
-            | KeyCode::KEY_UP
-            | KeyCode::KEY_DOWN
-            | KeyCode::KEY_LEFT
-            | KeyCode::KEY_RIGHT
-    )
+    /// An evdev event device to open explicitly.
+    #[arg(value_name = "/dev/input/eventN")]
+    device: Option<PathBuf>,
 }
 
 fn drain_voice_outputs(
@@ -137,7 +68,7 @@ fn drain_voice_outputs(
                     mapper.type_text(&text)?;
                 }
                 let _guard = output.lock().expect("output lock poisoned");
-                println!("[{path}] transcribed text (partial): {text}");
+                println!("[{path}] transcribed partial: {text}");
             }
             VoiceOutput::Status(status) => {
                 let _guard = output.lock().expect("output lock poisoned");
@@ -157,7 +88,7 @@ fn read_device(
     voice: VoiceInput,
     focus: Option<FocusMonitor>,
 ) -> Result<()> {
-    print_device_info(&path, &device);
+    dualsense::print_device_info(Path::new(&path), &device);
     device
         .set_nonblocking(true)
         .with_context(|| format!("[{path}] could not enable nonblocking input"))?;
@@ -190,6 +121,147 @@ fn read_device(
     }
 }
 
+fn handle_list() -> Result<()> {
+    let devices = dualsense::enumerate_devices();
+    if devices.is_empty() {
+        eprintln!("No readable evdev devices found under /dev/input.");
+        return Ok(());
+    }
+
+    for (path, device) in devices {
+        println!(
+            "{}: name={:?}, id={:?}, dualsense={}, gamepad={}",
+            path.display(),
+            device.name(),
+            device.input_id(),
+            dualsense::is_dualsense(&device),
+            dualsense::is_dualsense_gamepad(&device)
+        );
+    }
+    Ok(())
+}
+
+fn handle_light(color_name: String, path: Option<PathBuf>) -> Result<()> {
+    let turn_off = color_name.eq_ignore_ascii_case("off");
+    let color = if turn_off {
+        Some((0, 0, 0))
+    } else {
+        parse_color(&color_name)
+    };
+    let color = color.ok_or_else(|| {
+        anyhow!(
+            "invalid color '{}'; use RRGGBB, #RRGGBB, or off",
+            color_name
+        )
+    })?;
+
+    let controller = match path {
+        Some(path) => dualsense::open_controller(&path)?,
+        None => dualsense::discover_controller()
+            .ok_or_else(|| anyhow!("no DualSense gamepad evdev device found"))?,
+    };
+    let light = ControllerLight::from_event_path(&controller.path).ok_or_else(|| {
+        anyhow!(
+            "no RGB LED sysfs device found for {}. Check that hid-playstation is loaded",
+            controller.path.display()
+        )
+    })?;
+
+    if turn_off {
+        light.off()?;
+    } else {
+        light.set_rgb(color.0, color.1, color.2)?;
+    }
+    println!("Controller light set to {color_name}");
+    Ok(())
+}
+
+fn handle_tui(path: Option<PathBuf>) -> Result<()> {
+    #[cfg(feature = "tui")]
+    {
+        tui::run(path).context("TUI stopped")
+    }
+
+    #[cfg(not(feature = "tui"))]
+    {
+        let _ = path;
+        Err(anyhow!(
+            "the TUI is optional; run with: cargo run --features tui -- --tui"
+        ))
+    }
+}
+
+fn create_mapper() -> Result<KeyboardMapper> {
+    KeyboardMapper::new().context("could not create keyboard mapping devices")
+}
+
+fn create_voice(path: &Path) -> Result<VoiceInput> {
+    VoiceInput::new(ControllerLight::from_event_path(path))
+        .context("could not initialize voice input")
+}
+
+fn start_focus_monitor() -> Option<FocusMonitor> {
+    match FocusMonitor::start() {
+        Ok(focus) => focus,
+        Err(error) => {
+            eprintln!("Focused app detection unavailable: {error}");
+            None
+        }
+    }
+}
+
+fn handle_listen(path: Option<PathBuf>) -> Result<()> {
+    let controller = match path {
+        Some(path) => {
+            let device = dualsense::open_device(&path)?;
+            if dualsense::is_dualsense(&device) && !dualsense::is_dualsense_gamepad(&device) {
+                return Err(anyhow!(
+                    "{} is a DualSense auxiliary device; use the main gamepad event device instead",
+                    path.display()
+                ));
+            }
+            dualsense::ControllerDevice { path, device }
+        }
+        None => dualsense::discover_controller().ok_or_else(|| {
+            anyhow!(
+                "no DualSense evdev device found. Connect the controller and check that your user\n\
+                 can read /dev/input/event* (for example, via the input group), then try again.\n\
+                 Use `dualsense --list` to inspect the devices that are visible."
+            )
+        })?,
+    };
+
+    let mapper = create_mapper()?;
+    let voice = create_voice(&controller.path)?;
+    voice.spawn_microphone();
+    let output = Arc::new(Mutex::new(()));
+    let focus = start_focus_monitor();
+
+    // The reader blocks until the process is terminated. Keeping this path in
+    // one handler makes explicit and automatic device selection share setup.
+    read_device(
+        controller.path.display().to_string(),
+        controller.device,
+        output,
+        mapper,
+        voice,
+        focus,
+    )
+}
+
+fn run(cli: Cli) -> Result<()> {
+    if cli.list {
+        return handle_list();
+    }
+    if let Some(color) = cli.light {
+        return handle_light(color, cli.device);
+    }
+    if cli.tui {
+        return handle_tui(cli.device);
+    }
+    handle_listen(cli.device)
+}
+
 fn load_environment() {
     if let Err(error) = dotenvy::dotenv()
         && !error.not_found()
@@ -203,222 +275,8 @@ fn main() {
     // Existing process environment variables remain the source of truth.
     load_environment();
 
-    let args: Vec<_> = env::args_os().skip(1).collect();
-
-    if args.first().is_some_and(|arg| arg == "--light") {
-        if !(2..=3).contains(&args.len()) {
-            usage();
-            std::process::exit(2);
-        }
-        let color_name = args[1].to_string_lossy();
-        let turn_off = color_name.eq_ignore_ascii_case("off");
-        let color = if turn_off {
-            Some((0, 0, 0))
-        } else {
-            parse_color(&color_name)
-        };
-        let Some(color) = color else {
-            eprintln!(
-                "Invalid color '{}'; use RRGGBB, #RRGGBB, or off",
-                color_name
-            );
-            std::process::exit(2);
-        };
-
-        let selected = if let Some(path) = args.get(2).map(PathBuf::from) {
-            match Device::open(&path) {
-                Ok(device) if is_dualsense_gamepad(&device) => Some((path, device)),
-                Ok(_) => {
-                    eprintln!("{} is not a DualSense gamepad device", path.display());
-                    None
-                }
-                Err(error) => {
-                    eprintln!("Could not open {}: {error}", path.display());
-                    None
-                }
-            }
-        } else {
-            evdev::enumerate().find(|(_, device)| is_dualsense_gamepad(device))
-        };
-        let Some((path, _device)) = selected else {
-            eprintln!("No DualSense gamepad evdev device found.");
-            std::process::exit(1);
-        };
-        let Some(light) = ControllerLight::from_event_path(&path) else {
-            eprintln!(
-                "No RGB LED sysfs device found for {}. Check that hid-playstation is loaded.",
-                path.display()
-            );
-            std::process::exit(1);
-        };
-        let result = if turn_off {
-            light.off()
-        } else {
-            light.set_rgb(color.0, color.1, color.2)
-        };
-        if let Err(error) = result {
-            eprintln!("Could not change controller light: {error}");
-            std::process::exit(1);
-        }
-        println!("Controller light set to {color_name}");
-        return;
-    }
-
-    if args.first().is_some_and(|arg| arg == "--tui") {
-        if args.len() > 2 {
-            usage();
-            std::process::exit(2);
-        }
-
-        #[cfg(feature = "tui")]
-        {
-            let path = args.get(1).map(PathBuf::from);
-            if let Err(error) = tui::run(path) {
-                eprintln!("TUI stopped: {error}");
-                std::process::exit(1);
-            }
-            return;
-        }
-
-        #[cfg(not(feature = "tui"))]
-        {
-            eprintln!("The TUI is optional. Run with: cargo run --features tui -- --tui");
-            std::process::exit(2);
-        }
-    }
-
-    if args.len() > 1 {
-        usage();
-        std::process::exit(2);
-    }
-    if args
-        .first()
-        .is_some_and(|arg| arg == "-h" || arg == "--help")
-    {
-        usage();
-        return;
-    }
-
-    let output = Arc::new(Mutex::new(()));
-    let mut workers = Vec::new();
-    let focus = match FocusMonitor::start() {
-        Ok(focus) => focus,
-        Err(error) => {
-            eprintln!("Focused app detection unavailable: {error}");
-            None
-        }
-    };
-
-    if let Some(arg) = args.first() {
-        if arg == "--list" {
-            let mut found = false;
-            for (path, device) in evdev::enumerate() {
-                found = true;
-                println!(
-                    "{}: name={:?}, id={:?}, dualsense={}, gamepad={}",
-                    path.display(),
-                    device.name(),
-                    device.input_id(),
-                    is_dualsense(&device),
-                    is_dualsense_gamepad(&device)
-                );
-            }
-            if !found {
-                eprintln!("No readable evdev devices found under /dev/input.");
-            }
-            return;
-        }
-
-        let path = PathBuf::from(arg);
-        match Device::open(&path) {
-            Ok(device) => {
-                if is_dualsense(&device) && !is_dualsense_gamepad(&device) {
-                    eprintln!(
-                        "{} is a DualSense auxiliary device; use the main gamepad event device instead.",
-                        path.display()
-                    );
-                    return;
-                }
-
-                let mapper = match KeyboardMapper::new() {
-                    Ok(mapper) => mapper,
-                    Err(error) => {
-                        eprintln!("Could not create keyboard mapping devices: {error}");
-                        std::process::exit(1);
-                    }
-                };
-                let voice = match VoiceInput::new(ControllerLight::from_event_path(&path)) {
-                    Ok(voice) => voice,
-                    Err(error) => {
-                        eprintln!("Could not initialize voice input: {error}");
-                        std::process::exit(1);
-                    }
-                };
-                voice.spawn_microphone();
-                let path = path.display().to_string();
-                workers.push(thread::spawn({
-                    let output = Arc::clone(&output);
-                    move || read_device(path, device, output, mapper, voice, focus)
-                }));
-            }
-            Err(error) => {
-                eprintln!("Could not open {}: {error}", path.display());
-                std::process::exit(1);
-            }
-        }
-    } else {
-        let devices: Vec<_> = evdev::enumerate()
-            .filter(|(_, device)| is_dualsense_gamepad(device))
-            .collect();
-        let Some((voice_path, _)) = devices.first() else {
-            eprintln!(
-                "No DualSense evdev device found. Connect the controller and check that your user\n\
-                 can read /dev/input/event* (for example, via the input group), then try again.\n\
-                 Use `dualsense --list` to inspect the devices that are visible."
-            );
-            return;
-        };
-        let voice = match VoiceInput::new(ControllerLight::from_event_path(voice_path)) {
-            Ok(voice) => voice,
-            Err(error) => {
-                eprintln!("Could not initialize voice input: {error}");
-                return;
-            }
-        };
-        voice.spawn_microphone();
-        for (path, device) in devices {
-            let mapper = match KeyboardMapper::new() {
-                Ok(mapper) => mapper,
-                Err(error) => {
-                    eprintln!("Could not create keyboard mapping devices: {error}");
-                    return;
-                }
-            };
-            let path = path.display().to_string();
-            let voice = voice.clone();
-            let worker_focus = focus.clone();
-            workers.push(thread::spawn({
-                let output = Arc::clone(&output);
-                move || read_device(path, device, output, mapper, voice, worker_focus)
-            }));
-        }
-
-        if workers.is_empty() {
-            eprintln!(
-                "No DualSense evdev device found. Connect the controller and check that your user\n\
-                 can read /dev/input/event* (for example, via the input group), then try again.\n\
-                 Use `dualsense --list` to inspect the devices that are visible."
-            );
-            return;
-        }
-    }
-
-    // The workers block in fetch_events(). Ctrl-C terminates the process naturally.
-    for worker in workers {
-        match worker.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => eprintln!("Input worker stopped: {error:#}"),
-            Err(_) => eprintln!("Input worker panicked"),
-        }
+    if let Err(error) = run(Cli::parse()) {
+        eprintln!("{error:#}");
+        std::process::exit(1);
     }
 }
