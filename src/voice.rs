@@ -18,7 +18,6 @@ mod enabled {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
-    use std::ffi::CString;
     use std::io::Read;
     use std::sync::{
         Arc, Mutex,
@@ -819,59 +818,23 @@ mod enabled {
         }
     }
 
-    struct StderrSilencer {
-        saved: libc::c_int,
-    }
-
-    impl StderrSilencer {
-        fn new() -> io::Result<Self> {
-            let null_path = CString::new("/dev/null").expect("static path has no NUL");
-            let null = unsafe { libc::open(null_path.as_ptr(), libc::O_WRONLY) };
-            if null < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
-            if saved < 0 {
-                unsafe { libc::close(null) };
-                return Err(io::Error::last_os_error());
-            }
-            if unsafe { libc::dup2(null, libc::STDERR_FILENO) } < 0 {
-                unsafe {
-                    libc::close(null);
-                    libc::close(saved);
-                }
-                return Err(io::Error::last_os_error());
-            }
-            unsafe { libc::close(null) };
-            Ok(Self { saved })
-        }
-    }
-
-    impl Drop for StderrSilencer {
-        fn drop(&mut self) {
-            unsafe {
-                libc::dup2(self.saved, libc::STDERR_FILENO);
-                libc::close(self.saved);
-            }
-        }
-    }
-
     fn run_microphone(
         recording: Arc<AtomicBool>,
         commands: tokio_mpsc::UnboundedSender<WorkerMessage>,
         output: mpsc::Sender<VoiceOutput>,
     ) {
         let host = cpal::default_host();
-        let devices = {
-            let _stderr_silencer = StderrSilencer::new().ok();
-            match host.devices() {
-                Ok(devices) => devices.collect::<Vec<_>>(),
-                Err(error) => {
-                    let _ = output.send(VoiceOutput::Status(format!(
-                        "Microphone unavailable: {error}"
-                    )));
-                    return;
-                }
+        // Do not redirect the process-wide stderr while enumerating ALSA
+        // devices. The microphone runs on its own thread, so doing that can
+        // hide direct-mode diagnostics printed by the input reader, including
+        // the Wayland virtual-keyboard availability probe.
+        let devices = match host.devices() {
+            Ok(devices) => devices.collect::<Vec<_>>(),
+            Err(error) => {
+                let _ = output.send(VoiceOutput::Status(format!(
+                    "Microphone unavailable: {error}"
+                )));
+                return;
             }
         };
         let device = devices
