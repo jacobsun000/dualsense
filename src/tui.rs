@@ -1,3 +1,4 @@
+use crate::clipboard::Clipboard;
 use crate::dualsense;
 use crate::focus::FocusMonitor;
 use crate::input::{Button, ControllerEvent, EventDecoder};
@@ -549,38 +550,63 @@ enum ReaderMessage {
     Light([u8; 3]),
 }
 
-fn drain_voice_outputs(
+fn handle_voice_output(
     voice: &VoiceInput,
-    mapper: &mut KeyboardMapper,
+    clipboard: &Clipboard,
     sender: &Sender<ReaderMessage>,
-) -> Result<()> {
-    while let Some(message) = voice.try_recv() {
-        match message {
-            VoiceOutput::Transcript(text) => {
-                if !voice.type_final(&text)? {
-                    mapper.type_text(&text)?;
-                }
-                let _ = sender.send(ReaderMessage::MicStatus(format!("Voice input: {text}")));
-            }
-            VoiceOutput::PartialTranscript(text) => {
-                if !voice.type_partial(&text)? {
-                    mapper.type_text(&text)?;
-                }
+    message: VoiceOutput,
+) {
+    match message {
+        VoiceOutput::Transcript(text) => {
+            let _ = sender.send(ReaderMessage::MicStatus(format!("Voice input: {text}")));
+            if let Err(error) = voice.type_final(clipboard, &text) {
                 let _ = sender.send(ReaderMessage::MicStatus(format!(
-                    "Voice input (partial): {text}"
+                    "Clipboard paste failed: {error}"
                 )));
             }
-            VoiceOutput::Status(status) => {
-                let _ = sender.send(ReaderMessage::MicStatus(status));
-            }
-            VoiceOutput::MicSample { rms, peak } => {
-                let _ = sender.send(ReaderMessage::MicSample { rms, peak });
-            }
-            VoiceOutput::Light(rgb) => {
-                let _ = sender.send(ReaderMessage::Light(rgb));
+        }
+        VoiceOutput::PartialTranscript(text) => {
+            let _ = sender.send(ReaderMessage::MicStatus(format!(
+                "Voice input (partial): {text}"
+            )));
+            if let Err(error) = voice.type_partial(clipboard, &text) {
+                let _ = sender.send(ReaderMessage::MicStatus(format!(
+                    "Clipboard paste failed: {error}"
+                )));
             }
         }
+        VoiceOutput::Status(status) => {
+            let _ = sender.send(ReaderMessage::MicStatus(status));
+        }
+        VoiceOutput::MicSample { rms, peak } => {
+            let _ = sender.send(ReaderMessage::MicSample { rms, peak });
+        }
+        VoiceOutput::Light(rgb) => {
+            let _ = sender.send(ReaderMessage::Light(rgb));
+        }
     }
+}
+
+fn drain_voice_outputs(voice: &VoiceInput, clipboard: &Clipboard, sender: &Sender<ReaderMessage>) {
+    while let Some(message) = voice.try_recv() {
+        handle_voice_output(voice, clipboard, sender, message);
+    }
+}
+
+fn spawn_voice_output_handler(
+    voice: VoiceInput,
+    clipboard: Clipboard,
+    sender: Sender<ReaderMessage>,
+) -> Result<()> {
+    thread::Builder::new()
+        .name("dualsense-voice-output".to_owned())
+        .spawn(move || {
+            while let Some(message) = voice.recv() {
+                handle_voice_output(&voice, &clipboard, &sender, message);
+                drain_voice_outputs(&voice, &clipboard, &sender);
+            }
+        })
+        .context("could not start voice output handler")?;
     Ok(())
 }
 
@@ -600,12 +626,6 @@ fn spawn_reader(
         loop {
             if let Some(focus) = focus.as_ref() {
                 mapper.set_focused_app(focus.current());
-            }
-            if let Err(error) = drain_voice_outputs(&voice, &mut mapper, &sender) {
-                let _ = sender.send(ReaderMessage::Error(format!(
-                    "Voice input stopped: {error}"
-                )));
-                return;
             }
             match device.fetch_events() {
                 Ok(events) => {
@@ -1311,6 +1331,7 @@ pub fn run(path: Option<PathBuf>) -> Result<()> {
     let state = ControllerState::new(path.display().to_string(), &device);
     let voice = VoiceInput::new(state.light.clone())?;
     let mapper = KeyboardMapper::new()?;
+    let clipboard = Clipboard::new().context("could not initialize clipboard text input")?;
     let focus = match FocusMonitor::start() {
         Ok(focus) => focus,
         Err(error) => {
@@ -1318,6 +1339,7 @@ pub fn run(path: Option<PathBuf>) -> Result<()> {
             None
         }
     };
+    spawn_voice_output_handler(voice.clone(), clipboard.clone(), sender.clone())?;
     spawn_reader(device, sender.clone(), mapper, voice.clone(), focus);
     voice.spawn_microphone();
 
@@ -1339,7 +1361,7 @@ pub fn run(path: Option<PathBuf>) -> Result<()> {
 
     if let Err(error) = result {
         let _ = cleanup;
-        return Err(error.into());
+        return Err(error);
     }
     cleanup?;
     Ok(())

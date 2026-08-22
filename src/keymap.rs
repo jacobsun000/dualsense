@@ -264,12 +264,11 @@ pub const MAX_SCROLL_PER_SECOND: f32 = 24.0;
 
 /// Keys advertised by the virtual keyboard device.
 ///
-/// This includes the logical keys used by the default profile and the keys
-/// needed by [`crate::keyboard::KeyboardMapper::type_text`]. Keeping the list
-/// here makes adding a new configurable mapping less error-prone: add its key
-/// once to this capability list if it is not already present.
+/// This includes the logical keys used by the default profile. Keeping the
+/// list here makes adding a new configurable mapping less error-prone: add its
+/// key once to this capability list if it is not already present.
 pub const VIRTUAL_KEYBOARD_KEYS: &[KeyCode] = &[
-    // Letters and numbers used by text input and mappings.
+    // Letters and numbers used by controller mappings.
     KeyCode::KEY_A,
     KeyCode::KEY_B,
     KeyCode::KEY_C,
@@ -306,7 +305,7 @@ pub const VIRTUAL_KEYBOARD_KEYS: &[KeyCode] = &[
     KeyCode::KEY_7,
     KeyCode::KEY_8,
     KeyCode::KEY_9,
-    // Text punctuation and editing keys.
+    // Punctuation and editing keys used by controller mappings.
     KeyCode::KEY_MINUS,
     KeyCode::KEY_EQUAL,
     KeyCode::KEY_LEFTBRACE,

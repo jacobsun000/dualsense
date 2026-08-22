@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+mod clipboard;
+use clipboard::Clipboard;
 mod dualsense;
 mod focus;
 use focus::FocusMonitor;
@@ -28,7 +30,7 @@ mod tui;
     name = "dualsense",
     version,
     about = "Read and map DualSense controller input",
-    long_about = "Read and map DualSense controller input.\n\nWith no argument, listen to the automatically discovered gamepad evdev device.\nPass an event device path to listen to that device explicitly.\nUse --light to change the controller RGB indicator.\nHold the right face button (○) to dictate through OPENAI_API_KEY.\nUse --tui for an interactive status screen when the tui feature is enabled."
+    long_about = "Read and map DualSense controller input.\n\nWith no argument, listen to the automatically discovered gamepad evdev device.\nPass an event device path to listen to that device explicitly.\nUse --light to change the controller RGB indicator.\nHold the right face button (○) to dictate through OPENAI_API_KEY.\nClipboard paste uses Ctrl+Shift+V by default; set DUALSENSE_VOICE_PASTE=ctrl-v when needed.\nUse --tui for an interactive status screen when the tui feature is enabled."
 )]
 struct Cli {
     /// Print all readable evdev devices and their DualSense classification.
@@ -48,35 +50,68 @@ struct Cli {
     device: Option<PathBuf>,
 }
 
-fn drain_voice_outputs(
+fn handle_voice_output(
     path: &str,
     voice: &VoiceInput,
-    mapper: &mut KeyboardMapper,
+    clipboard: &Clipboard,
     output: &Arc<Mutex<()>>,
-) -> Result<()> {
-    while let Some(message) = voice.try_recv() {
-        match message {
-            VoiceOutput::Transcript(text) => {
-                if !voice.type_final(&text)? {
-                    mapper.type_text(&text)?;
-                }
+    message: VoiceOutput,
+) {
+    match message {
+        VoiceOutput::Transcript(text) => {
+            {
                 let _guard = output.lock().expect("output lock poisoned");
                 println!("[{path}] transcribed text: {text}");
             }
-            VoiceOutput::PartialTranscript(text) => {
-                if !voice.type_partial(&text)? {
-                    mapper.type_text(&text)?;
-                }
+            if let Err(error) = voice.type_final(clipboard, &text) {
+                let _guard = output.lock().expect("output lock poisoned");
+                eprintln!("[{path}] clipboard paste failed: {error}");
+            }
+        }
+        VoiceOutput::PartialTranscript(text) => {
+            {
                 let _guard = output.lock().expect("output lock poisoned");
                 println!("[{path}] transcribed partial: {text}");
             }
-            VoiceOutput::Status(status) => {
+            if let Err(error) = voice.type_partial(clipboard, &text) {
                 let _guard = output.lock().expect("output lock poisoned");
-                eprintln!("[{path}] {status}");
+                eprintln!("[{path}] clipboard paste failed: {error}");
             }
-            VoiceOutput::Light(_) | VoiceOutput::MicSample { .. } => {}
         }
+        VoiceOutput::Status(status) => {
+            let _guard = output.lock().expect("output lock poisoned");
+            eprintln!("[{path}] {status}");
+        }
+        VoiceOutput::Light(_) | VoiceOutput::MicSample { .. } => {}
     }
+}
+
+fn drain_voice_outputs(
+    path: &str,
+    voice: &VoiceInput,
+    clipboard: &Clipboard,
+    output: &Arc<Mutex<()>>,
+) {
+    while let Some(message) = voice.try_recv() {
+        handle_voice_output(path, voice, clipboard, output, message);
+    }
+}
+
+fn spawn_voice_output_handler(
+    path: String,
+    voice: VoiceInput,
+    clipboard: Clipboard,
+    output: Arc<Mutex<()>>,
+) -> Result<()> {
+    thread::Builder::new()
+        .name("dualsense-voice-output".to_owned())
+        .spawn(move || {
+            while let Some(message) = voice.recv() {
+                handle_voice_output(&path, &voice, &clipboard, &output, message);
+                drain_voice_outputs(&path, &voice, &clipboard, &output);
+            }
+        })
+        .context("could not start voice output handler")?;
     Ok(())
 }
 
@@ -98,7 +133,6 @@ fn read_device(
         if let Some(focus) = focus.as_ref() {
             mapper.set_focused_app(focus.current());
         }
-        drain_voice_outputs(&path, &voice, &mut mapper, &output).context("voice input stopped")?;
         match device.fetch_events() {
             Ok(events) => {
                 for raw_event in events {
@@ -232,15 +266,23 @@ fn handle_listen(path: Option<PathBuf>) -> Result<()> {
     };
 
     let mapper = create_mapper()?;
+    let clipboard = Clipboard::new().context("could not initialize clipboard text input")?;
     let voice = create_voice(&controller.path)?;
     voice.spawn_microphone();
     let output = Arc::new(Mutex::new(()));
     let focus = start_focus_monitor();
+    let controller_path = controller.path.display().to_string();
+    spawn_voice_output_handler(
+        controller_path.clone(),
+        voice.clone(),
+        clipboard.clone(),
+        Arc::clone(&output),
+    )?;
 
     // The reader blocks until the process is terminated. Keeping this path in
     // one handler makes explicit and automatic device selection share setup.
     read_device(
-        controller.path.display().to_string(),
+        controller_path,
         controller.device,
         output,
         mapper,

@@ -2,8 +2,9 @@
 //!
 //! Holding the right face button (○) captures the controller microphone, streams 24 kHz PCM audio to
 //! OpenAI's realtime transcription session, and returns transcript updates to the
-//! input reader. Text is entered through Wayland with Unicode support.
+//! input reader. Transcript deltas and completed transcripts are pasted through the Wayland clipboard.
 
+use crate::clipboard::Clipboard;
 use crate::input::ControllerEvent;
 #[cfg(feature = "voice")]
 use crate::input::{Button, ButtonState, ControllerEventKind};
@@ -20,7 +21,7 @@ mod enabled {
     use serde_json::{Value, json};
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     };
     use std::thread;
@@ -30,8 +31,6 @@ mod enabled {
         MaybeTlsStream, WebSocketStream, connect_async,
         tungstenite::{Message, client::IntoClientRequest},
     };
-    use wrtype::WrtypeClient;
-
     const INPUT_RATE: u32 = 24_000;
     const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
     const VOICE_BUTTON: Button = Button::East;
@@ -43,67 +42,6 @@ mod enabled {
         Status(String),
         MicSample { rms: f32, peak: f32 },
         Light([u8; 3]),
-    }
-
-    #[derive(Default)]
-    struct TextInput {
-        client: Option<WrtypeClient>,
-        attempted: bool,
-        partial_seen: bool,
-        partial_typed: bool,
-    }
-
-    impl TextInput {
-        fn ensure_client(&mut self, output: &mpsc::Sender<VoiceOutput>) -> bool {
-            if self.attempted {
-                return self.client.is_some();
-            }
-            self.attempted = true;
-            match WrtypeClient::new() {
-                Ok(client) => {
-                    self.client = Some(client);
-                    let display =
-                        std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".to_owned());
-                    let session =
-                        std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "<unset>".to_owned());
-                    let _ = output.send(VoiceOutput::Status(format!(
-                        "Wayland virtual keyboard: available (WAYLAND_DISPLAY={display}, XDG_SESSION_TYPE={session})"
-                    )));
-                    true
-                }
-                Err(error) => {
-                    let display =
-                        std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".to_owned());
-                    let session =
-                        std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "<unset>".to_owned());
-                    let _ = output.send(VoiceOutput::Status(format!(
-                        "Wayland virtual keyboard: unavailable (WAYLAND_DISPLAY={display}, XDG_SESSION_TYPE={session}); deferring partials until the final transcript: {error}"
-                    )));
-                    false
-                }
-            }
-        }
-
-        fn begin_turn(&mut self) {
-            self.partial_seen = false;
-            self.partial_typed = false;
-        }
-
-        fn type_text(&mut self, text: &str, output: &mpsc::Sender<VoiceOutput>) -> Result<bool> {
-            if !self.ensure_client(output) {
-                return Ok(false);
-            }
-            let Some(client) = self.client.as_mut() else {
-                return Ok(false);
-            };
-            // `text_input` is locked for the whole call by each public typing
-            // method, so multiple partials and the final transcript are sent
-            // synchronously and in order.
-            client
-                .type_text(text)
-                .map(|()| true)
-                .map_err(|error| anyhow!(error))
-        }
     }
 
     struct AudioChunk {
@@ -125,7 +63,8 @@ mod enabled {
         outputs: Arc<Mutex<mpsc::Receiver<VoiceOutput>>>,
         output_sender: mpsc::Sender<VoiceOutput>,
         microphone_started: Arc<AtomicBool>,
-        text_input: Arc<Mutex<TextInput>>,
+        turn: Arc<AtomicU64>,
+        partial_turn: Arc<AtomicU64>,
         light: Option<ControllerLight>,
     }
 
@@ -162,13 +101,10 @@ mod enabled {
                 outputs: Arc::new(Mutex::new(output_receiver)),
                 output_sender,
                 microphone_started: Arc::new(AtomicBool::new(false)),
-                text_input: Arc::new(Mutex::new(TextInput::default())),
+                turn: Arc::new(AtomicU64::new(0)),
+                partial_turn: Arc::new(AtomicU64::new(u64::MAX)),
                 light,
             };
-            // Probe the compositor during startup so direct mode reports the
-            // actual text-input transport before the first voice turn. The
-            // successful client is retained for subsequent partials.
-            input.probe_text_input();
             input.set_light([0, 0, 255]);
             Ok(input)
         }
@@ -184,7 +120,7 @@ mod enabled {
 
             match state {
                 ButtonState::Down if !self.recording.swap(true, Ordering::AcqRel) => {
-                    self.begin_text_turn();
+                    self.turn.fetch_add(1, Ordering::AcqRel);
                     self.set_light([0, 255, 0]);
                     let _ = self.commands.send(WorkerMessage::Start);
                 }
@@ -223,75 +159,28 @@ mod enabled {
                 .and_then(|receiver| receiver.try_recv().ok())
         }
 
-        fn probe_text_input(&self) {
-            let Ok(mut input) = self.text_input.lock() else {
-                let _ = self.output_sender.send(VoiceOutput::Status(
-                    "Voice text-input state is unavailable".to_owned(),
-                ));
-                return;
-            };
-            let _ = input.ensure_client(&self.output_sender);
+        pub fn recv(&self) -> Option<VoiceOutput> {
+            self.outputs.lock().ok()?.recv().ok()
         }
 
-        fn begin_text_turn(&self) {
-            let Ok(mut input) = self.text_input.lock() else {
-                let _ = self.output_sender.send(VoiceOutput::Status(
-                    "Voice text-input state is unavailable".to_owned(),
-                ));
-                return;
-            };
-            input.begin_turn();
+        /// Paste each incremental transcription delta immediately.
+        pub fn type_partial(&self, clipboard: &Clipboard, text: &str) -> Result<()> {
+            let turn = self.turn.load(Ordering::Acquire);
+            self.partial_turn.store(turn, Ordering::Release);
+            paste_text(clipboard, text)
         }
 
-        /// Deliver a transcript delta through the ordered virtual keyboard.
-        ///
-        /// If wrtype is unavailable, the delta is deferred and the final
-        /// transcript is attempted once through the normal fallback path.
-        pub fn type_partial(&self, text: &str) -> Result<bool> {
-            let mut input = self
-                .text_input
-                .lock()
-                .map_err(|_| anyhow!("voice text-input state is unavailable"))?;
-
-            // The text-input mutex is held while wrtype sends this complete
-            // delta, preventing concurrent partials from overtaking one another.
-            input.partial_seen = true;
-            match input.type_text(text, &self.output_sender)? {
-                true => {
-                    input.partial_typed = true;
-                    Ok(true)
-                }
-                false => {
-                    // Defer the delta rather than asking the raw uinput
-                    // mapper to type it and then duplicating it at completion.
-                    Ok(true)
-                }
+        /// Paste a completed transcript only when no deltas were delivered.
+        pub fn type_final(&self, clipboard: &Clipboard, text: &str) -> Result<()> {
+            let turn = self.turn.load(Ordering::Acquire);
+            if self
+                .partial_turn
+                .compare_exchange(turn, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
             }
-        }
-
-        /// Complete a transcript turn without duplicating streamed deltas.
-        ///
-        /// When virtual-keyboard delivery was unavailable, partials were
-        /// deferred and this final transcript is delivered once through wrtype
-        /// (or the raw uinput fallback). When all partials were typed, the
-        /// final API event is only an acknowledgement.
-        pub fn type_final(&self, text: &str) -> Result<bool> {
-            let mut input = self
-                .text_input
-                .lock()
-                .map_err(|_| anyhow!("voice text-input state is unavailable"))?;
-            if input.partial_seen {
-                let partial_typed = input.partial_typed;
-                input.partial_seen = false;
-                input.partial_typed = false;
-                if partial_typed {
-                    return Ok(true);
-                }
-
-                return input.type_text(text, &self.output_sender);
-            }
-
-            input.type_text(text, &self.output_sender)
+            paste_text(clipboard, text)
         }
 
         fn set_light(&self, rgb: [u8; 3]) {
@@ -309,6 +198,14 @@ mod enabled {
                 }
             }
         }
+    }
+
+    fn paste_text(clipboard: &Clipboard, text: &str) -> Result<()> {
+        let snapshot = clipboard.snapshot()?;
+        let paste_result = clipboard.paste(text.to_owned());
+        let restore_result = clipboard.restore(snapshot);
+        paste_result?;
+        restore_result
     }
 
     type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -1041,11 +938,15 @@ impl VoiceInput {
         None
     }
 
-    pub fn type_partial(&self, _: &str) -> Result<bool> {
-        Ok(false)
+    pub fn recv(&self) -> Option<VoiceOutput> {
+        None
     }
 
-    pub fn type_final(&self, _: &str) -> Result<bool> {
-        Ok(false)
+    pub fn type_partial(&self, _: &Clipboard, _: &str) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn type_final(&self, _: &Clipboard, _: &str) -> Result<()> {
+        Ok(())
     }
 }

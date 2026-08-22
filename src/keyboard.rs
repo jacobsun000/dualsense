@@ -15,9 +15,6 @@ use std::{
     time::Instant,
 };
 
-const NO_MODIFIERS: &[KeyCode] = &[];
-const SHIFT: &[KeyCode] = &[KeyCode::KEY_LEFTSHIFT];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct KeyCombo {
     modifiers: &'static [KeyCode],
@@ -96,23 +93,6 @@ impl KeyboardMapper {
         if self.focused_app != focused_app {
             self.focused_app = focused_app;
         }
-    }
-
-    /// Type text through the virtual keyboard. Letter keycodes are translated
-    /// for Colemak in the same way as the controller's logical mappings.
-    pub fn type_text(&mut self, text: &str) -> Result<()> {
-        for character in text.chars() {
-            let Some((key, shift)) = text_key(character) else {
-                continue;
-            };
-            let combo = physical_combo(KeyStroke::with_modifiers(
-                if shift { SHIFT } else { NO_MODIFIERS },
-                key,
-            ));
-            self.emit_combo(combo, true)?;
-            self.emit_combo(combo, false)?;
-        }
-        Ok(())
     }
 
     pub fn handle(&mut self, event: ControllerEvent) -> Result<()> {
@@ -357,89 +337,6 @@ fn colemak_physical_key(key: KeyCode) -> KeyCode {
 
 fn key_event(code: KeyCode, down: bool) -> InputEvent {
     InputEvent::new(EventType::KEY.0, code.0, if down { 1 } else { 0 })
-}
-
-fn text_key(character: char) -> Option<(KeyCode, bool)> {
-    let (character, shift) = if character.is_ascii_uppercase() {
-        (character.to_ascii_lowercase(), true)
-    } else {
-        (character, false)
-    };
-    let (key, punctuation_shift) = match character {
-        'a' => (KeyCode::KEY_A, false),
-        'b' => (KeyCode::KEY_B, false),
-        'c' => (KeyCode::KEY_C, false),
-        'd' => (KeyCode::KEY_D, false),
-        'e' => (KeyCode::KEY_E, false),
-        'f' => (KeyCode::KEY_F, false),
-        'g' => (KeyCode::KEY_G, false),
-        'h' => (KeyCode::KEY_H, false),
-        'i' => (KeyCode::KEY_I, false),
-        'j' => (KeyCode::KEY_J, false),
-        'k' => (KeyCode::KEY_K, false),
-        'l' => (KeyCode::KEY_L, false),
-        'm' => (KeyCode::KEY_M, false),
-        'n' => (KeyCode::KEY_N, false),
-        'o' => (KeyCode::KEY_O, false),
-        'p' => (KeyCode::KEY_P, false),
-        'q' => (KeyCode::KEY_Q, false),
-        'r' => (KeyCode::KEY_R, false),
-        's' => (KeyCode::KEY_S, false),
-        't' => (KeyCode::KEY_T, false),
-        'u' => (KeyCode::KEY_U, false),
-        'v' => (KeyCode::KEY_V, false),
-        'w' => (KeyCode::KEY_W, false),
-        'x' => (KeyCode::KEY_X, false),
-        'y' => (KeyCode::KEY_Y, false),
-        'z' => (KeyCode::KEY_Z, false),
-        '0' => (KeyCode::KEY_0, false),
-        '1' => (KeyCode::KEY_1, false),
-        '2' => (KeyCode::KEY_2, false),
-        '3' => (KeyCode::KEY_3, false),
-        '4' => (KeyCode::KEY_4, false),
-        '5' => (KeyCode::KEY_5, false),
-        '6' => (KeyCode::KEY_6, false),
-        '7' => (KeyCode::KEY_7, false),
-        '8' => (KeyCode::KEY_8, false),
-        '9' => (KeyCode::KEY_9, false),
-        ')' => (KeyCode::KEY_0, true),
-        '!' => (KeyCode::KEY_1, true),
-        '@' => (KeyCode::KEY_2, true),
-        '#' => (KeyCode::KEY_3, true),
-        '$' => (KeyCode::KEY_4, true),
-        '%' => (KeyCode::KEY_5, true),
-        '^' => (KeyCode::KEY_6, true),
-        '&' => (KeyCode::KEY_7, true),
-        '*' => (KeyCode::KEY_8, true),
-        '(' => (KeyCode::KEY_9, true),
-        ' ' => (KeyCode::KEY_SPACE, false),
-        '\t' => (KeyCode::KEY_TAB, false),
-        '\n' | '\r' => (KeyCode::KEY_ENTER, false),
-        '-' => (KeyCode::KEY_MINUS, false),
-        '_' => (KeyCode::KEY_MINUS, true),
-        '=' => (KeyCode::KEY_EQUAL, false),
-        '+' => (KeyCode::KEY_EQUAL, true),
-        '[' => (KeyCode::KEY_LEFTBRACE, false),
-        '{' => (KeyCode::KEY_LEFTBRACE, true),
-        ']' => (KeyCode::KEY_RIGHTBRACE, false),
-        '}' => (KeyCode::KEY_RIGHTBRACE, true),
-        '\\' => (KeyCode::KEY_BACKSLASH, false),
-        '|' => (KeyCode::KEY_BACKSLASH, true),
-        ';' => (KeyCode::KEY_SEMICOLON, false),
-        ':' => (KeyCode::KEY_SEMICOLON, true),
-        '\'' => (KeyCode::KEY_APOSTROPHE, false),
-        '"' => (KeyCode::KEY_APOSTROPHE, true),
-        '`' => (KeyCode::KEY_GRAVE, false),
-        '~' => (KeyCode::KEY_GRAVE, true),
-        ',' => (KeyCode::KEY_COMMA, false),
-        '<' => (KeyCode::KEY_COMMA, true),
-        '.' => (KeyCode::KEY_DOT, false),
-        '>' => (KeyCode::KEY_DOT, true),
-        '/' => (KeyCode::KEY_SLASH, false),
-        '?' => (KeyCode::KEY_SLASH, true),
-        _ => return None,
-    };
-    Some((key, shift || punctuation_shift))
 }
 
 fn scroll_speed(value: f32, deadzone: f32, max_scroll_per_second: f32) -> f32 {
